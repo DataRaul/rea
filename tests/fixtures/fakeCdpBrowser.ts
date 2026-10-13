@@ -1,4 +1,8 @@
-import { createServer, type IncomingMessage } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 
 import { WebSocket, WebSocketServer } from "ws";
 
@@ -24,6 +28,7 @@ export const startFakeCdpBrowser = async (
     referer: string | undefined;
   }[] = [];
   const sockets = new Set<WebSocket>();
+  let openedConnections = 0;
   let frameTreeReads = 0;
   let port = 0;
   const http = createServer((request, response) => {
@@ -34,13 +39,7 @@ export const startFakeCdpBrowser = async (
       referer: request.headers.referer,
     });
     response.setHeader("content-type", "application/json");
-    if (
-      request.url?.startsWith("/app.js.map") === true &&
-      options.sourceMapBody !== undefined
-    ) {
-      response.end(options.sourceMapBody);
-      return;
-    }
+    if (serveSourceMap(request, response, options)) return;
     if (request.url === "/json/version") {
       response.end(
         options.oversizedDiscovery === true
@@ -87,6 +86,7 @@ export const startFakeCdpBrowser = async (
   });
   webSockets.on("connection", (socket: WebSocket, request: IncomingMessage) => {
     const directPage = request.url?.startsWith("/devtools/page/") === true;
+    openedConnections += 1;
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
     socket.on("message", (raw) => {
@@ -143,6 +143,8 @@ export const startFakeCdpBrowser = async (
     browserWebSocketUrl: `ws://127.0.0.1:${String(port)}/devtools/browser/fake`,
     allowedOrigin: endpoint,
     commands,
+    activeConnectionCount: () => sockets.size,
+    openedConnectionCount: () => openedConnections,
     emitRawMessage(message) {
       for (const socket of sockets) socket.send(message);
     },
@@ -196,22 +198,47 @@ const replyToCommand = (
     );
     return;
   }
-  socket.send(
-    JSON.stringify({
-      id: command.id,
-      result,
-    }),
-  );
-  if (options.malformedEventOnMethod === command.method)
-    socket.send("{not-json");
-  if (options.malformedEventShapeOnMethod === command.method)
-    socket.send(JSON.stringify({ method: 42 }));
+  const reply = () => {
+    socket.send(
+      JSON.stringify({
+        id: command.id,
+        result,
+      }),
+    );
+    if (options.malformedEventOnMethod === command.method)
+      socket.send("{not-json");
+    if (options.malformedEventShapeOnMethod === command.method)
+      socket.send(JSON.stringify({ method: 42 }));
+  };
+  const eventsFirst =
+    options.eventsBeforeReply?.includes(command.method) === true;
+  if (!eventsFirst) reply();
   const customEvents = options.commandEvents?.(
     command,
     `http://127.0.0.1:${String(port)}`,
   );
   if (customEvents === undefined) emitEvents(socket, command, port, options);
   else for (const event of customEvents) socket.send(JSON.stringify(event));
+  if (eventsFirst) reply();
   if (options.closeAfterMethod === command.method)
     setImmediate(() => socket.close());
+};
+
+const serveSourceMap = (
+  request: IncomingMessage,
+  response: ServerResponse,
+  options: FakeOptions,
+): boolean => {
+  if (options.sourceMapBody === undefined) return false;
+  if (request.url?.startsWith("/app.js.map") === true) {
+    if (options.sourceMapRedirect !== undefined)
+      response.writeHead(302, { location: options.sourceMapRedirect }).end();
+    else response.end(options.sourceMapBody);
+    return true;
+  }
+  if (request.url === options.sourceMapRedirect) {
+    response.end(options.sourceMapBody);
+    return true;
+  }
+  return false;
 };

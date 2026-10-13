@@ -6,6 +6,8 @@ import { expect, it } from "vitest";
 import {
   SEMANTIC_GRAPH_FILE_NODE_CEILING,
   SEMANTIC_GRAPH_NODE_CEILING,
+  createJavaScriptSemanticGraphProjection,
+  projectJavaScriptSemanticFileSteps,
 } from "./JavaScriptSemanticGraphBuilder.js";
 import {
   addSemanticGraphNode,
@@ -355,7 +357,7 @@ const semanticNodeFor = (roleKey: string) => {
     unpacked: false,
     text: { included: true, value: "" },
   };
-  const state = createSemanticGraphProjectionState({ nodes: [] });
+  const state = createSemanticGraphProjectionState();
   return constructSemanticGraphNode(
     file,
     {
@@ -565,7 +567,7 @@ it("does not mark a file truncated when it exactly fills its budget", () => {
 it("only records node loss when the budget rejects a new identity", () => {
   // The truncation signal must record blocked node creation, not a zero
   // remaining budget: a file using exactly its share drops nothing.
-  const state = createSemanticGraphProjectionState({ nodes: [] });
+  const state = createSemanticGraphProjectionState();
   state.fileNodeBudget = 2;
   state.fileNodesDropped = false;
   const first = addSemanticGraphNode(state, semanticNodeFor("first"));
@@ -761,37 +763,42 @@ it.each([
   },
 );
 
-it("retains array length presence without inventing an exact length", () => {
-  const graph = graphFor("const root = [, 1]; const length = root.length;");
-  const slot = graph.nodes.find(
-    ({ kind, properties }) =>
-      kind === "property-slot" && properties.property_pointer === "/length",
-  );
-  expect(slot?.properties).toMatchObject({
-    name: "length",
-    presence: "present",
-    value_status: "unknown",
-  });
-  const trace = queryJavaScriptSemanticGraph(graph, {
-    seed: { kind: "property", name: "length" },
-    direction: "forward-influence",
-    allowed_relations: ["reads-property"],
-  });
-  expect(trace.seed_node_ids).toEqual([slot?.node_id]);
-  expect(trace.relations).toContainEqual(
-    expect.objectContaining({
-      source_node_id: slot?.node_id,
-      relation: "reads-property",
-      resolution: "resolved",
-    }),
-  );
-  expect(
-    graph.relations.some(
-      ({ target_node_id, relation }) =>
-        target_node_id === slot?.node_id && relation === "defines",
-    ),
-  ).toBe(false);
-});
+it.each(["", "root.length = 0;", "root.length = query(); root[0] = 9;"])(
+  "retains array length presence without inventing an exact length after %s",
+  (mutation) => {
+    const graph = graphFor(
+      `const root = [, 1]; ${mutation} const length = root.length;`,
+    );
+    const slot = graph.nodes.find(
+      ({ kind, properties }) =>
+        kind === "property-slot" && properties.property_pointer === "/length",
+    );
+    expect(slot?.properties).toMatchObject({
+      name: "length",
+      presence: "present",
+      value_status: "unknown",
+    });
+    const trace = queryJavaScriptSemanticGraph(graph, {
+      seed: { kind: "property", name: "length" },
+      direction: "forward-influence",
+      allowed_relations: ["reads-property"],
+    });
+    expect(trace.seed_node_ids).toEqual([slot?.node_id]);
+    expect(trace.relations).toContainEqual(
+      expect.objectContaining({
+        source_node_id: slot?.node_id,
+        relation: "reads-property",
+        resolution: "resolved",
+      }),
+    );
+    expect(
+      graph.relations.some(
+        ({ target_node_id, relation }) =>
+          target_node_id === slot?.node_id && relation === "defines",
+      ),
+    ).toBe(false);
+  },
+);
 
 it.each([
   ["object spread", 'const root = { known: "value", ...dynamic };'],
@@ -900,3 +907,48 @@ it.each(["{}", "unknownRoot", "{ a: null }"])(
     expect(trace.nodes.filter(({ kind }) => kind === "literal")).toEqual([]);
   },
 );
+
+it("projects and adopts more than the default per-file capacity when explicitly offered", () => {
+  const text = "external;\n".repeat(20_001);
+  const file: JavaScriptArtifactFile = {
+    path: "large.js",
+    container_sha256: SHA256,
+    sha256: SHA256,
+    bytes: Buffer.byteLength(text),
+    inventory_artifact_id: `art_${SHA256}`,
+    kind: "javascript",
+    unpacked: false,
+    text: { included: true, value: text },
+  };
+  const steps = projectJavaScriptSemanticFileSteps(
+    file,
+    analyzeJavaScriptSemantics(text),
+    20_002,
+  );
+  let result = steps.next();
+  while (!result.done) result = steps.next();
+  expect(result.value.nodes).toHaveLength(20_002);
+  expect(result.value.truncated).toBe(false);
+  const projection = createJavaScriptSemanticGraphProjection({
+    totalNodes: 20_010,
+    fileNodes: 20_002,
+  });
+  projection.adoptFileProjection(result.value);
+  expect(projection.remainingFileNodeBudget()).toBe(8);
+  const graph = projection.finish(SHA256, {
+    graph_id: `jag_${"b".repeat(64)}`,
+    nodes: [],
+  });
+  expect(graph.coverage).toMatchObject({
+    truncated: false,
+    omitted_nodes: 0,
+    omitted_relations: 0,
+  });
+  const bounded = createJavaScriptSemanticGraphProjection({
+    totalNodes: 20_001,
+    fileNodes: 20_002,
+  });
+  expect(() => bounded.adoptFileProjection(result.value)).toThrow(
+    "exceed the offered tree capacity",
+  );
+});

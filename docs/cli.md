@@ -20,7 +20,80 @@ files when neither `--provider` nor `--snapshot` is supplied. See
 [JavaScript artifact reconstruction](javascript-artifact-reconstruction.md)
 for results, integrity checks and coverage.
 
+The complete application Evidence can be hundreds of megabytes for a real
+application. When an agent or a person reads the result, save it to a file and
+project a summary, a module page or one module from the saved Evidence:
+
+```bash
+rea analyze-javascript-application /absolute/path/to/app --json > app-evidence.json
+jq -c '{source: {kind: "inline", evidence: .}, view: {kind: "summary"}}' app-evidence.json > app-view.json
+rea inspect-analysis-view app-view.json
+```
+
+For example, a 334 MB Obsidian application Evidence file yields a summary view
+of about 10 KB. Replace the view with
+`{"kind": "page", "collection": "modules", "offset": 0, "limit": 32}` for a
+module page. See
+[JavaScript application workflows](javascript-application-workflows.md) for
+views, feature traces and comparisons that take the same saved Evidence.
+
+## Managed assemblies (.NET)
+
+For a .NET PE/CLI assembly, inspect its identity and deployment form before
+inspecting members. These commands read metadata and Common Intermediate
+Language (CIL) without loading or executing the assembly and require no native
+analysis engine:
+
+```bash
+rea inspect-managed-artifact /absolute/path/Assembly.dll --json
+rea inspect-managed-members /absolute/path/Assembly.dll --json
+rea inspect-managed-members /absolute/path/Assembly.dll --type Example.Parser --json
+```
+
+Replace `Example.Parser` with an exact `full_name` from the member inspection,
+or a declaring type name you already know. Omit `--type` to inspect all members,
+or repeat it to select several types.
+Selection limits decoding to the selected types; member references remain an
+assembly-wide inventory, so the output can still be large.
+
+Choose the workflow from the artifact's contents rather than its `.exe` or
+`.dll` extension. The managed parser requires PE/CLI metadata; it does not
+unpack .NET single-file hosts or decode IL2CPP metadata. NativeAOT method bodies
+require native analysis. See the [managed-code guide](managed-code-analysis.md)
+for supported deployment forms, selection semantics, and coverage limits.
+
+## SQLite snapshots
+
+For a local database snapshot, use `rea inspect-sqlite-database PATH --json`.
+Add `--table NAME --row-limit 20` to read a bounded sample from an ordinary
+table. This command does not require a native analysis provider. See
+[SQLite database snapshots](sqlite-databases.md) for database/WAL identity,
+source-file handling and row-value semantics.
+
 ## Native analysis
+
+Inspect embedded Go build metadata without installing Go or configuring a
+disassembler:
+
+```bash
+rea inspect-go-binary /absolute/path/to/program --json
+```
+
+The shared CLI/MCP workflow reports compiler version, modules, replacements,
+build settings, original bytes and SHA-256. See [Go binaries](go-binaries.md)
+for supported containers and absent or malformed metadata.
+
+Inspect an embedded cargo-auditable Rust dependency list without installing
+Rust or configuring a disassembler:
+
+```bash
+rea inspect-rust-binary /absolute/path/to/program --json
+```
+
+The same workflow reports package names, versions, sources, the root package,
+dependency edges, and the section's file range. A missing `.dep-v0` section is
+null metadata, not proof that the binary has no dependencies. See
+[Rust binaries](rust-binaries.md).
 
 Configure [Hopper or Ghidra](installation.md#hopper), or the
 [IDA adapter](ida-provider.md), before analyzing a native target. Substitute
@@ -40,9 +113,10 @@ a function dossier; `decompile` returns pseudocode. For assembly instructions
 alone, use `rea instructions`. A macOS `.app` bundle can be supplied directly.
 
 Run `rea --help` or a command's `--help` for arguments and output options.
-The [generated catalog](product-catalog.json) lists all CLI commands and MCP
+The [generated catalog](mcp-contracts.md#generated-catalog) lists all CLI commands and MCP
 tools. Provider-specific target support is described in the
-[native guide](native-investigation.md), [DOS guide](ghidra-dos.md), and
+[native guide](native-investigation.md), [DOS guide](ghidra-dos.md),
+[raw binary guide](raw-binary.md), and
 [Windows Ghidra guide](windows-ghidra-p0.md).
 
 ## Choose a provider
@@ -96,13 +170,25 @@ an exact result when the target bytes, operation, parameters, provider and
 settings match. Mutations and cursor-dependent calls are excluded from the
 cache. Snapshot files are local and use owner-only permissions.
 
+Dispatching a metadata write invalidates the active session's snapshot cache,
+even if its reply fails: the provider may already have applied the write.
+Close and reopen the target before importing or saving another snapshot.
+
+Snapshots retain eligible target-scoped question histories in full, including
+mutation Evidence recorded while another target was active. Observations and
+related questions must still belong to the saved target. If those dependencies
+cannot be retained, the entire history is excluded instead of reverting the
+question to an earlier revision or disposition.
+
 ```bash
 rea analyze /absolute/path/to/program --provider ghidra --snapshot /absolute/path/to/analysis/program.json
 # Repeat the same query to reuse its saved result.
 rea analyze /absolute/path/to/program --provider ghidra --snapshot /absolute/path/to/analysis/program.json
 ```
 
-An exact CLI cache hit is read before starting a provider process.
+An exact CLI cache hit is normally read before starting a provider process.
+On Windows, Ghidra first admits the selected source through its native snapshot
+owner, so replay can start that provider.
 In MCP, `open_binary` accepts `snapshot_path` to import a snapshot atomically
 for its matching target; an MCP provider may still start before returning a
 cached result. `close_binary` accepts `snapshot_path` and optional
@@ -140,12 +226,49 @@ Import an older source tree to compare with the current artifact:
 
 ```bash
 rea import-reference-source /absolute/path/to/source
+rea import-reference-source /absolute/path/to/source --detail summary --outline-depth 2 --json
 ```
 
+The default (`--detail full`) returns the complete `HistoricalSourceGraph`.
+Choose `--detail summary` for a `HistoricalSourceSummary` of that same committed
+inventory: its `HistoricalSourceManifest` contains the full graph and root
+digests, with provenance, VCS facts, languages, manifest paths, entry and
+relationship counts, parse-failure counts, file/directory states, exclusions
+and limitations. The summary is a presentation view, not a graph accepted by
+source-to-bundle comparison; keep the full output for that workflow.
+
+`--outline-depth` requires `--detail summary` and accepts a nonnegative safe
+integer. Depth 1 shows root children, depth 2 (the default) also shows their
+children, and depth 0 omits all outline entries. Paths retain canonical Unicode
+code-point order. `outline.omitted_entry_count` counts only inventoried entries
+hidden by the chosen depth; it does not count unexamined children of excluded or
+unreadable directories, or change `inventory_state`. Exclusions and source
+limitations remain separate from this presentation omission.
+
+`file_sizes.known_bytes` is the exact sum of known inventoried file sizes as
+decimal text, so large sums cannot lose integer precision. Unknown sizes count
+in `file_sizes.unknown_file_count`; excluded or unexamined paths are not included
+in that total. A zero known-byte sum therefore does not establish an empty source
+tree. Full output retains individual file hashes, relationships and parse-failure
+diagnostics. Summary mode performs the same import and cleanup, then projects
+the committed result without rereading source files. It reduces the selected
+output, not the amount of source examined. A shallow tree or many exclusions can
+still produce a large summary; depth 0 removes the outline but preserves the
+other facts. No fixed output-size or runtime improvement is promised.
+
 The import records hashes and metadata for the supplied files, separately
-from observations of the current app. File names do not automatically exclude
-files. Set `REA_REFERENCE_SECRET_PATTERNS_JSON` to a JSON array of ignore
-patterns when you want to exclude selected paths.
+from observations of the current app. For a directory inside a Git checkout,
+it records the HEAD of the nearest enclosing repository; whether the working
+tree matches that commit remains unknown. It honors the source tree's `.gitignore`
+and applies default exclusions for common generated and dependency paths such
+as `node_modules/`, `dist/`, and `*.log`. Pattern-based exclusions record the
+matched pattern and whether it came from project, default, caller, or sensitive
+path policy. Set `REA_REFERENCE_SECRET_PATTERNS_JSON` to a JSON array of ignore
+patterns when you want to mark selected paths as sensitive; those patterns are
+reported separately as configured-secret exclusions.
+
+Re-import saved graphs whose pattern-based exclusions lack `pattern` before
+using them in source-to-bundle comparisons.
 
 JavaScript and TypeScript import parsing requires valid UTF-8. Malformed source
 bytes retain their original hashes and sizes with a decoding diagnostic; REA
@@ -173,7 +296,10 @@ user permissions; consult the chosen guide for host requirements and effects.
 ## Output and exit status
 
 The default terminal format is TOON. Use `--json` when saving results for a
-JSON consumer. Output selection and formatting do not change operation status.
+JSON consumer. `--json` is indented on a terminal and compact when piped or
+redirected, which keeps large results smaller for agents and scripts; pipe
+through `jq .` for indented files. Output selection and formatting do not change
+operation status.
 
 | Status    | Meaning                                                                                                                                              |
 | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |

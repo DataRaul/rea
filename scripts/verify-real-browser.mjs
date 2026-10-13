@@ -9,7 +9,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { CdpBrowserProvider } from "../dist/browser/CdpBrowserProvider.js";
-import { waitForBrowserDevtoolsPort } from "../dist/browser/BrowserProcessStartup.js";
+import {
+  BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
+  waitForBrowserDevtoolsPort,
+} from "../dist/browser/BrowserProcessStartup.js";
 import { createBrowserScenarioProvider } from "../dist/composition/browserScenario.js";
 import {
   inspectWebPageInputSchema,
@@ -42,11 +45,12 @@ import { verifyBrowserNetworkEvidence } from "./lib/browser-network-e2e.mjs";
 import { verifyBrowserScriptExport } from "./lib/browser-script-export-e2e.mjs";
 import { verifyBrowserModules } from "./lib/browser-module-e2e.mjs";
 import { verifyBrowserDomDestinations } from "./lib/browser-dom-destinations-e2e.mjs";
+import { verifyBrowserSocketTransport } from "./lib/browser-socket-e2e.mjs";
 import { verifyBrowserCaptureMetadataBudget } from "./lib/browser-capture-metadata-budget-e2e.mjs";
 import { artifactCliEvidence, artifactMcpResult } from "./lib/artifact-e2e.mjs";
 import { verifyScenarioEnvironment } from "./lib/browser-scenario-environment-e2e.mjs";
+import { verifyScenarioStorage } from "./lib/browser-scenario-storage-e2e.mjs";
 
-const REAL_BROWSER_STARTUP_TIMEOUT_MS = 60_000;
 const SCENARIO_SECRET_VALUE = "rea-browser-verifier-secret";
 const SCENARIO_URL_SECRET_VALUE = "rea-browser-url-verifier-secret";
 process.env.REA_BROWSER_VERIFIER_SECRET = SCENARIO_SECRET_VALUE;
@@ -64,6 +68,7 @@ try {
     executable,
     [
       "--headless=new",
+      "--password-store=basic",
       ...(process.env.REA_BROWSER_NO_SANDBOX === "true"
         ? ["--no-sandbox"]
         : []),
@@ -90,7 +95,7 @@ try {
     executable,
     activePortPath: join(profile, "DevToolsActivePort"),
     stderr: () => stderr,
-    timeoutMs: REAL_BROWSER_STARTUP_TIMEOUT_MS,
+    timeoutMs: BROWSER_DEVTOOLS_STARTUP_TIMEOUT_MS,
   });
   const endpoint = `http://127.0.0.1:${String(port)}`;
   const provider = new CdpBrowserProvider();
@@ -230,6 +235,13 @@ try {
 
   pageProxy = await startPageCdpProxy(endpoint);
   await verifyPageScopedTransport(provider, pageProxy, site.origin);
+  const browserSocketTransport = await verifyBrowserSocketTransport({
+    provider,
+    profile,
+    endpoint,
+    target,
+    origin: site.origin,
+  });
   const attachedScenarioInput = browserScenario(
     {
       mode: "connect",
@@ -275,11 +287,18 @@ try {
     throw new Error("Scenario attachment terminated its external browser");
 
   const profilesBefore = await scenarioProfiles();
+  process.stderr.write("Browser verifier: scenario environment\n");
   const scenarioEnvironment = await verifyScenarioEnvironment(
     endpoint,
     target,
     site.origin,
   );
+  process.stderr.write("Browser verifier: scenario storage\n");
+  const scenarioStorage = await verifyScenarioStorage({
+    executable,
+    endpoint,
+    targetId: target,
+  });
   const launchedScenario = await createBrowserScenarioProvider(
     process.env,
   ).captureScenario(
@@ -332,7 +351,9 @@ try {
         `Browser scenario included unselected structured value: ${unselectedValue}`,
       );
 
+  process.stderr.write("Browser verifier: large screenshot\n");
   const largeScreenshot = await verifyLargeScreenshotE2e(endpoint, site.origin);
+  process.stderr.write("Browser verifier: popup coverage\n");
   const popupEvents = await verifyPopupEventCoverage(executable);
   const networkEvidence = await verifyBrowserNetworkEvidence(
     executable,
@@ -354,12 +375,17 @@ try {
     scripts: observed.value.scripts.items.length,
     networkRequests: observed.value.network.requests.length,
     consoleEvents: observed.value.console.events.length,
-    websocketEvents: observed.value.network.websocket_events.length,
+    websocketConnections: observed.value.network.websocket_connections.length,
+    websocketFrames: observed.value.network.websocket_connections.reduce(
+      (total, connection) => total + connection.events.length,
+      0,
+    ),
     bundleScripts: bundle.capture.scripts_analyzed,
     sourceMaps: bundle.observations.source_maps.processed,
     bundle_cli_and_stdio_mcp: true,
     sessionEvents: session.value.timeline.length,
     pageScopedTransport: true,
+    browserSocketTransport,
     screenshotBytes: screenshot.value.artifact.bytes,
     largeScreenshot,
     popupEvents,
@@ -373,6 +399,7 @@ try {
     browserScenarioLaunchCleanup: "terminated-owned-process",
     scenarioFailure,
     scenarioEnvironment,
+    scenarioStorage,
     verified: true,
   };
 } finally {

@@ -1,14 +1,18 @@
 {
   "$schema": "https://turborepo.dev/schema.json",
+  "cacheMaxAge": "7d",
+  "cacheMaxSize": "500MB",
+  "globalDependencies": [".nvmrc", ".npmrc"],
+  "globalPassThroughEnv": ["GOMAXPROCS", "GOMEMLIMIT", "UV_THREADPOOL_SIZE"],
   "tasks": {
     "compile": {
       "dependsOn": ["metadata:check"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/check-dependency-install.mjs",
         "scripts/clean-build-output.mjs",
+        "scripts/bundle-runtime.mjs",
         "scripts/generate-package-metadata.mjs",
         "src/**/*.ts",
         "!src/**/*.test.ts",
@@ -20,7 +24,6 @@
     },
     "typecheck": {
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "src/**/*.ts",
@@ -39,27 +42,56 @@
         "package-lock.json",
         "scripts/generate-package-metadata.mjs",
         "scripts/lib/generated-file.mjs",
-        "skill-src/reverse-engineer-anything/SKILL.md",
+        ".agents/skills/reverse-engineer-anything/SKILL.md",
         "src/generatedPackageMetadata.ts"
       ]
     },
     "lint": {
+      "outputs": [".cache/static-checks/oxlint.json"],
       "inputs": [
-        ".nvmrc",
+        ".gitignore",
         ".oxlintrc.json",
         "package.json",
         "package-lock.json",
         "scripts/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
         "src/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
         "tests/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
-        "vitest.config.ts"
+        "docs/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "website/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "experiments/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "!docs/.vitepress/cache/**",
+        "!docs/.vitepress/dist/**",
+        "!website/_site/**",
+        "!experiments/analysis-efficiency/results/**",
+        "*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}"
+      ]
+    },
+    "lint:built": {
+      "dependsOn": ["compile"],
+      "outputs": [".cache/static-checks/oxlint.json"],
+      "inputs": [
+        ".gitignore",
+        ".oxlintrc.json",
+        "package.json",
+        "package-lock.json",
+        "scripts/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "src/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "tests/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "docs/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "website/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "experiments/**/*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}",
+        "!docs/.vitepress/cache/**",
+        "!docs/.vitepress/dist/**",
+        "!website/_site/**",
+        "!experiments/analysis-efficiency/results/**",
+        "*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}"
       ]
     },
     "format:check": {},
     "knip": {
       "dependsOn": ["compile"],
       "inputs": [
-        ".nvmrc",
+        ".gitignore",
         "knip.json",
         "package.json",
         "package-lock.json",
@@ -67,7 +99,9 @@
         "src/**/*.ts",
         "tests/**/*.ts",
         "tsconfig.json",
-        "tsconfig.build.json"
+        "tsconfig.build.json",
+        "docs/.vitepress/config.ts",
+        "*.{cjs,cts,js,jsx,mjs,mts,ts,tsx}"
       ]
     },
     "jscpd": {
@@ -76,9 +110,11 @@
         ".jscpd.json",
         "package.json",
         "package-lock.json",
+        "scripts/ci/static-check-report.mjs",
         "src/**",
         "tests/**"
-      ]
+      ],
+      "outputs": [".cache/static-checks/jscpd/jscpd-report.json"]
     },
     "scan:todos": {
       "inputs": [
@@ -89,31 +125,12 @@
       ]
     },
     "test:run": {
+      "cache": false,
       "dependsOn": [
         "artifacts:mcp-catalog",
         "artifacts:product-catalog",
         "artifacts:managed-evidence",
         "artifacts:skills"
-      ],
-      "inputs": [
-        ".nvmrc",
-        "package.json",
-        "package-lock.json",
-        "src/**",
-        "tests/**",
-        "scripts/**",
-        "bridge/**",
-        "vitest.config.ts",
-        {
-          "mode": "dependencyOutputs",
-          "globs": [
-            ".cache/mcp-tool-catalog.json",
-            "skills/**",
-            "docs/public/product-catalog.json",
-            "docs/verification/managed-conformance-manifest.json",
-            "docs/verification/managed-conformance-ledger.json"
-          ]
-        }
       ]
     },
     "docs:check:built": {
@@ -123,7 +140,6 @@
         "artifacts:skills"
       ],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-*.mjs",
@@ -135,11 +151,12 @@
         "scripts/fixtures/apple/*.mjs",
         "src/generated*.ts",
         "src/contracts/**/*.ts",
+        "licenses/**",
         "docs/**",
         "!docs/public/product-catalog.json",
         "!docs/verification/managed-conformance-*.json",
-        "skill-src/**",
-        "README.md",
+        ".agents/skills/reverse-engineer-anything/**",
+        "README*.md",
         {
           "mode": "dependencyOutputs",
           "globs": [
@@ -154,7 +171,6 @@
     "artifacts:mcp-catalog": {
       "dependsOn": ["compile"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-mcp-tool-catalog.mjs",
@@ -165,19 +181,17 @@
     "artifacts:skills": {
       "dependsOn": ["compile"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-skill-metadata.mjs",
         "scripts/lib/generated-file.mjs",
-        "skill-src/**"
+        ".agents/skills/reverse-engineer-anything/**"
       ],
       "outputs": ["skills/**"]
     },
     "artifacts:product-catalog": {
       "dependsOn": ["compile"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-product-catalog.mjs",
@@ -189,7 +203,6 @@
     "artifacts:managed-evidence": {
       "dependsOn": ["artifacts:skills"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-completion-ledger.mjs",
@@ -205,7 +218,6 @@
     "artifacts:error-schema": {
       "dependsOn": ["compile"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-error-schema.mjs",
@@ -218,7 +230,6 @@
     "mcp-catalog:check:built": {
       "dependsOn": ["artifacts:mcp-catalog"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-mcp-tool-catalog.mjs",
@@ -232,7 +243,6 @@
     "evidence:check:built": {
       "dependsOn": ["artifacts:managed-evidence"],
       "inputs": [
-        ".nvmrc",
         "package.json",
         "package-lock.json",
         "scripts/generate-completion-ledger.mjs",

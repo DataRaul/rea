@@ -27,7 +27,11 @@ export const readManagedValue = <Value>(
   try {
     return operation();
   } catch (cause: unknown) {
-    if (!(cause instanceof ManagedReaderFailure)) throw cause;
+    if (
+      !(cause instanceof ManagedReaderFailure) ||
+      cause.issue.code === "resource-limit"
+    )
+      throw cause;
     issues.push(cause.issue);
     return undefined;
   }
@@ -39,3 +43,14 @@ export const uniqueManagedParseIssues = (
 ): readonly ManagedParseIssue[] => [
   ...new Map(issues.map((issue) => [JSON.stringify(issue), issue])).values(),
 ];
+
+/**
+ * Append issue lists one issue at a time. Spreading a list into `push` passes
+ * one argument per issue, which overflows the stack on large malformed inputs.
+ */
+export const appendManagedParseIssues = (
+  issues: ManagedParseIssue[],
+  ...found: readonly (readonly ManagedParseIssue[])[]
+): void => {
+  for (const list of found) for (const issue of list) issues.push(issue);
+};

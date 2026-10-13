@@ -5,16 +5,23 @@ import {
   linuxHopperInstallDisclosure,
   type LinuxPackageFamily,
 } from "./LinuxHopper.js";
-import { skillDestinations } from "./SetupSkill.js";
+import type { SkillDestination } from "./SetupSkill.js";
 import { macHopperInstallDisclosure } from "./MacHopper.js";
 import type {
+  ClientConfigurationInspection,
   SetupAction,
   SetupClientState,
   SetupHost,
   SetupProviderEnvironment,
 } from "./SetupTypes.js";
-import type { SetupClient } from "./SupportedClients.js";
+import {
+  appDataRedirection,
+  registrationPersistenceDetail,
+  type SetupClient,
+} from "./SupportedClients.js";
+import { redirectedWriteBlocker } from "./MsixPackageStorage.js";
 import type { DoctorReport } from "./Doctor.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 /** Read-only setup facts shared by client selection and preflight. */
 export interface SetupDiscovery {
@@ -49,7 +56,8 @@ export const discoverSetupState = async (input: {
   const hopperInstallSupported =
     (input.host.platform === "darwin" &&
       majorVersion((await input.host.macosVersion()) ?? "0") >= 12) ||
-    (input.host.platform === "linux" && linuxDistribution?.supported === true);
+    (input.host.platform === "linux" &&
+      linuxDistribution?.hopperSetupSupported === true);
   const installHopper =
     input.forceHopperInstall ||
     (hopperInstallSupported &&
@@ -160,12 +168,58 @@ export const planSetupActions = async (input: {
       blocker: `${invalid.client.displayName ?? invalid.client.name}: ${invalid.inspection.remediation}`,
     };
   }
-  const clientPlans = inspections.flatMap(({ client, inspection }) =>
+  const clientPlans = plannedClientWrites(
+    inspections,
+    input.discovery.installHopper,
+  );
+  const plannedActions = setupPlan({
+    platform: input.host.platform,
+    homeDirectory: input.host.homeDirectory,
+    installHopper: input.discovery.installHopper,
+    installSkill: input.installSkill,
+    skillClientIds: input.skillClientIds,
+    skillDestinations: input.host.skillDestinations(input.skillClientIds),
+    clients: clientPlans,
+    providerEnvironment: input.providerEnvironment,
+    ...(input.discovery.linuxPackageFamily === undefined
+      ? {}
+      : { linuxPackageFamily: input.discovery.linuxPackageFamily }),
+    command: input.command,
+  });
+  const blocker =
+    (clientPlans.length > 0
+      ? input.host.registrationCommandBlocker
+      : undefined) ??
+    redirectedWriteBlocker(
+      appDataRedirection(input.discovery.clients),
+      plannedActions
+        .filter(({ kind }) => kind !== "install_hopper")
+        .map(({ target }) => target),
+      "setup",
+    );
+  return {
+    plannedActions,
+    selectedClients,
+    clientsToConfigure: selectedClients.filter((client) =>
+      clientPlans.some(({ client: planned }) => planned.name === client.name),
+    ),
+    ...(blocker === undefined ? {} : { blocker }),
+  };
+};
+
+/** Selected clients whose registration setup writes, with the disclosed operation. */
+const plannedClientWrites = (
+  inspections: readonly {
+    readonly client: SetupClient;
+    readonly inspection: ClientConfigurationInspection;
+  }[],
+  installHopper: boolean,
+) =>
+  inspections.flatMap(({ client, inspection }) =>
     client.format !== "unsupported" &&
     (inspection.status === "create" ||
       inspection.status === "update" ||
-      (input.discovery.installHopper &&
-        inspection.status === "already_current"))
+      (installHopper && inspection.status === "already_current"))
       ? [
           {
             client,
@@ -181,27 +235,6 @@ export const planSetupActions = async (input: {
         ]
       : [],
   );
-  return {
-    plannedActions: setupPlan({
-      platform: input.host.platform,
-      homeDirectory: input.host.homeDirectory,
-      installHopper: input.discovery.installHopper,
-      installSkill: input.installSkill,
-      skillClientIds: input.skillClientIds,
-      claudeCodeSkillsDirectory: input.host.claudeCodeSkillsDirectory,
-      clients: clientPlans,
-      providerEnvironment: input.providerEnvironment,
-      ...(input.discovery.linuxPackageFamily === undefined
-        ? {}
-        : { linuxPackageFamily: input.discovery.linuxPackageFamily }),
-      command: input.command,
-    }),
-    selectedClients,
-    clientsToConfigure: selectedClients.filter((client) =>
-      clientPlans.some(({ client: planned }) => planned.name === client.name),
-    ),
-  };
-};
 
 /** Describe every selected setup mutation before user approval. */
 const setupPlan = (input: {
@@ -210,7 +243,7 @@ const setupPlan = (input: {
   readonly installHopper: boolean;
   readonly installSkill: boolean;
   readonly skillClientIds: readonly string[];
-  readonly claudeCodeSkillsDirectory: string;
+  readonly skillDestinations: readonly SkillDestination[];
   readonly clients: readonly {
     readonly client: SetupClient;
     readonly operation: "create" | "update";
@@ -258,7 +291,7 @@ const setupPlan = (input: {
       label: client.displayName ?? client.name,
       target: client.configPath,
       detail: clientConfigurationDetail(
-        client.displayName ?? client.name,
+        client,
         input.command,
         input.providerEnvironment,
         input.installHopper,
@@ -268,15 +301,8 @@ const setupPlan = (input: {
       ...(backupPath === undefined ? {} : { backupPath }),
     })),
   ...(input.installSkill
-    ? skillDestinations(
-        input.homeDirectory,
-        input.skillClientIds,
-        input.claudeCodeSkillsDirectory,
-      ).map(({ client, path }): SetupAction => ({
-        id:
-          client === "claude_code"
-            ? "install_skill:claude_code"
-            : "install_skill",
+    ? input.skillDestinations.map(({ client, path }): SetupAction => ({
+        id: client === "shared" ? "install_skill" : `install_skill:${client}`,
         kind: "install_skill",
         label:
           client === "claude_code"
@@ -309,22 +335,23 @@ const majorVersion = (version: string): number =>
   Number.parseInt(version.split(".")[0] ?? "0", 10);
 
 const clientConfigurationDetail = (
-  client: string,
+  client: SetupClient,
   command: readonly string[],
   environment: SetupProviderEnvironment,
   installHopper: boolean,
 ): string => {
   const entries = Object.entries(environment)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
     .map(([name, value]) => `${name}=${value}`);
   const environmentDetail =
     entries.length === 0
-      ? " No additional environment variables."
-      : ` Environment: ${entries.join(", ")}.`;
+      ? " No additional provider environment variables. Existing server environment overrides are retained."
+      : ` Detected provider environment: ${entries.join(", ")}. Existing server environment overrides are retained; detected values replace matching keys.`;
   const hopperDetail = installHopper
     ? environment.HOPPER_LAUNCHER_PATH === undefined
       ? " If this plan installs Hopper, REA will add HOPPER_LAUNCHER_PATH using the launcher path reported by that installation."
       : " The HOPPER_LAUNCHER_PATH value shown above is the current fallback; if this plan installs Hopper, REA will replace it with the launcher path reported by that installation."
     : "";
-  return `Add the REA MCP registration for ${client}; preserve unrelated configuration. Command: ${command.map((part) => JSON.stringify(part)).join(" ")}.${environmentDetail}${hopperDetail}`;
+  const persistence = registrationPersistenceDetail(client);
+  return `Add the REA MCP registration for ${client.displayName ?? client.name}; preserve unrelated configuration. The backup path reflects the configuration inspected for this plan; if that file changes before execution, setup will select a recovery path for its current contents. Command: ${command.map((part) => JSON.stringify(part)).join(" ")}.${environmentDetail}${hopperDetail}${persistence === undefined ? "" : ` ${persistence}`}`;
 };

@@ -7,10 +7,13 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { execFileOutput } from "../process/ExecFileOutput.js";
+import {
+  downloadHopperPackage,
+  HOPPER_DOWNLOAD_BYTES,
+} from "./HopperDownload.js";
 
 const execFileAsync = promisify(execFile);
 const DOWNLOAD_PREFIX = "https://www.hopperapp.com:443/downloader/public/";
-const MAX_PACKAGE_BYTES = 100_000_000;
 const SUPPORTED_HOPPER_SHA256 = new Set([
   "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded",
   "1339f9e58377442b0c6fcb0dfc3cec20d593cc557408521fad9a00dbc6b8da13",
@@ -73,18 +76,34 @@ interface LinuxDistributionIdentity {
   readonly versionId?: string;
 }
 
-/** Parsed Linux distribution information used for support and package selection. */
+/**
+ * Parsed Linux distribution information used for package selection.
+ *
+ * `hopperSetupSupported` is the automated Hopper installer's tested list. It is
+ * narrower than the hosts where REA itself runs, which {@link supportsReaHost}
+ * answers from the package family.
+ */
 export type LinuxDistribution = LinuxDistributionIdentity &
   (
     | {
         readonly packageFamily: LinuxPackageFamily;
-        readonly supported: true;
+        readonly hopperSetupSupported: true;
       }
     | {
         readonly packageFamily: LinuxPackageFamily | undefined;
-        readonly supported: false;
+        readonly hopperSetupSupported: false;
       }
   );
+
+/**
+ * Whether REA's analysis providers run on this distribution. A recognized
+ * package family means a glibc host with a known package layout, which is what
+ * the providers need; downloading and installing the official Hopper package
+ * additionally requires a distribution on its tested list.
+ */
+export const supportsReaHost = (
+  distribution: LinuxDistribution | undefined,
+): boolean => distribution?.packageFamily !== undefined;
 
 /** Download response kept independent of Node's global fetch implementation. */
 export interface LinuxHopperDownload {
@@ -138,19 +157,23 @@ export const parseLinuxDistribution = (text: string): LinuxDistribution => {
     const key = match[1];
     const encoded = match[2];
     if (key === undefined || encoded === undefined) continue;
-    const value =
-      encoded.startsWith('"') && encoded.endsWith('"')
-        ? encoded.slice(1, -1).replaceAll('\\"', '"').replaceAll("\\\\", "\\")
-        : encoded;
+    const quote = encoded[0];
+    const quoted = (quote === "'" || quote === '"') && encoded.endsWith(quote);
+    const value = !quoted
+      ? encoded
+      : quote === "'"
+        ? encoded.slice(1, -1)
+        : encoded.slice(1, -1).replace(/\\(["\\$`])/gu, "$1");
     fields.set(key, value);
   }
   const id = (fields.get("ID") ?? "unknown").toLowerCase();
   const versionId = fields.get("VERSION_ID");
   const packageFamily = packageFamilyFor(id, fields.get("ID_LIKE"));
-  const supported =
+  const hopperSetupSupported =
     packageFamily !== undefined &&
     (id === "arch" ||
       id === "cachyos" ||
+      (id === "omarchy" && packageFamily === "arch") ||
       (id === "ubuntu" && versionAtLeast(versionId, 24)) ||
       (id === "fedora" && versionAtLeast(versionId, 41)) ||
       (id === "nobara" && versionAtLeast(versionId, 44)));
@@ -158,9 +181,9 @@ export const parseLinuxDistribution = (text: string): LinuxDistribution => {
     id,
     ...(versionId === undefined ? {} : { versionId }),
   };
-  return supported
-    ? { ...identity, packageFamily, supported: true }
-    : { ...identity, packageFamily, supported: false };
+  return hopperSetupSupported
+    ? { ...identity, packageFamily, hopperSetupSupported: true }
+    : { ...identity, packageFamily, hopperSetupSupported: false };
 };
 
 /** Read and classify the current Linux distribution. */
@@ -189,7 +212,7 @@ export const installLinuxHopper = async (
   if (options.signal?.aborted === true)
     return { status: "failed", reason: "cancelled" };
   const distribution = await host.distribution();
-  if (distribution?.supported !== true)
+  if (distribution?.hopperSetupSupported !== true)
     return { status: "failed", reason: "unsupported_host" };
   let temporary: string | undefined;
   try {
@@ -231,16 +254,7 @@ export const systemLinuxHopperInstallHost = (
   environment: Readonly<NodeJS.ProcessEnv>,
 ): LinuxHopperInstallHost => ({
   distribution: readLinuxDistribution,
-  async download(url, options) {
-    const response = await fetch(url, {
-      headers: { accept: "application/json", "user-agent": "rea-installer" },
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
-    });
-    return {
-      ok: response.ok,
-      bytes: new Uint8Array(await response.arrayBuffer()),
-    };
-  },
+  download: downloadHopperPackage,
   createTemporaryDirectory: () => mkdtemp(join(tmpdir(), "rea-hopper-")),
   writeArchive: (path, bytes) => writeFile(path, bytes, { mode: 0o600 }),
   installPackage: (family, archive) =>
@@ -350,7 +364,7 @@ const packageIntegrityMatches = (
   release: LinuxHopperRelease,
 ): boolean =>
   bytes.byteLength === Number(release.file_length) &&
-  bytes.byteLength <= MAX_PACKAGE_BYTES &&
+  bytes.byteLength <= HOPPER_DOWNLOAD_BYTES &&
   createHash("sha1").update(bytes).digest("hex") === release.file_hash;
 
 const packageFamilyFor = (

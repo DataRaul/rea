@@ -1,11 +1,5 @@
 import { Cli, z } from "incur";
 
-import {
-  inspectElectronPage,
-  listElectronTargets,
-} from "../application/javascript/ElectronObservationService.js";
-import { captureElectronScenario } from "../application/javascript/ElectronActiveObservationService.js";
-import { reconcileJavaScriptRuntimeEvidence } from "../application/javascript/JavaScriptRuntimeReconciliationService.js";
 import { logCliCommand } from "../cliLogging.js";
 import {
   inspectElectronPageInputSchema,
@@ -24,7 +18,6 @@ import {
   javascriptApplicationOptions,
 } from "../cliObservationOptions.js";
 import { runCliJavaScriptApplicationAnalysis } from "./javascriptApplicationAnalysis.js";
-import type { CliResultOutput } from "./streamedJsonOutput.js";
 import { withCommandCancellation } from "./commandCancellation.js";
 
 /** Register CLI equivalents of the Electron MCP tools. */
@@ -32,11 +25,10 @@ export const registerElectronCommands = (
   cli: ReturnType<typeof Cli.create>,
   logger: Logger,
   environment: Readonly<Record<string, string | undefined>>,
-  resultOutput?: CliResultOutput,
 ): void => {
   registerElectronObservationCommands(cli, logger);
   registerElectronActiveCommand(cli, logger, environment);
-  registerJavaScriptApplicationCommand(cli, logger, resultOutput);
+  registerJavaScriptApplicationCommand(cli, logger);
   registerJavaScriptRuntimeReconciliationCommand(cli, logger);
 };
 
@@ -78,6 +70,8 @@ const registerElectronActiveCommand = (
                 parsed.error.issues,
                 input.value,
               );
+            const { captureElectronScenario } =
+              await import("../application/javascript/ElectronActiveObservationService.js");
             const { createElectronScenarioProvider } =
               await import("../composition/electronScenario.js");
             const result = await captureElectronScenario(
@@ -116,6 +110,8 @@ const registerJavaScriptRuntimeReconciliationCommand = (
             "reconcile_javascript_runtime",
           );
           if (!input.ok) return input.error;
+          const { reconcileJavaScriptRuntimeEvidence } =
+            await import("../application/javascript/JavaScriptRuntimeReconciliationService.js");
           const result = reconcileJavaScriptRuntimeEvidence(input.value);
           return result.ok ? result.value : cliError(result.error);
         },
@@ -148,6 +144,8 @@ const registerElectronTargetList = (
           cdp_endpoint: args.endpoint,
         });
         if (!parsed.success) return inputError("list_electron_targets");
+        const { listElectronTargets } =
+          await import("../application/javascript/ElectronObservationService.js");
         const result = await listElectronTargets(context.provider, parsed.data);
         return result.ok ? result.value : cliError(result.error);
       }),
@@ -175,6 +173,8 @@ const registerElectronPageInspection = (
           include_script_sources: options.includeScriptSources,
         });
         if (!parsed.success) return inputError("inspect_electron_page");
+        const { inspectElectronPage } =
+          await import("../application/javascript/ElectronObservationService.js");
         const result = await inspectElectronPage(context.provider, parsed.data);
         return result.ok ? result.value : cliError(result.error);
       }),
@@ -184,7 +184,6 @@ const registerElectronPageInspection = (
 const registerJavaScriptApplicationCommand = (
   cli: ReturnType<typeof Cli.create>,
   logger: Logger,
-  resultOutput?: CliResultOutput,
 ): void => {
   cli.command(CLI_COMMANDS.analyzeJavaScriptApplication, {
     description:
@@ -193,8 +192,7 @@ const registerJavaScriptApplicationCommand = (
       path: z.string().describe("ASAR or extracted application path"),
     }),
     options: javascriptApplicationOptions,
-    alias: { integrityPolicy: "integrity-policy" },
-    run: ({ args, options, format }) =>
+    run: ({ args, options }) =>
       withCommandCancellation((signal) =>
         logCliCommand(logger, CLI_COMMANDS.analyzeJavaScriptApplication, () =>
           runCliJavaScriptApplicationAnalysis(
@@ -202,14 +200,25 @@ const registerJavaScriptApplicationCommand = (
               input_path: args.path,
               format: options.artifactFormat,
               integrity_policy: options.integrityPolicy,
+              ...(options.maxSemanticNodes === undefined
+                ? {}
+                : { max_semantic_nodes: options.maxSemanticNodes }),
+              ...(options.maxSemanticNodesPerFile === undefined
+                ? {}
+                : {
+                    max_semantic_nodes_per_file:
+                      options.maxSemanticNodesPerFile,
+                  }),
+              ...(options.sourcePath === undefined
+                ? {}
+                : { source_paths: options.sourcePath }),
+              ...(options.maxHeapMb === undefined
+                ? {}
+                : { max_heap_mb: options.maxHeapMb }),
+              ...(options.analysisTimeoutMs === undefined
+                ? {}
+                : { analysis_timeout_ms: options.analysisTimeoutMs }),
             },
-            resultOutput === undefined
-              ? undefined
-              : {
-                  output: resultOutput,
-                  command: CLI_COMMANDS.analyzeJavaScriptApplication,
-                  format,
-                },
             signal,
           ),
         ),

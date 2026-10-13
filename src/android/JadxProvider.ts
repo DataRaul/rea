@@ -18,15 +18,20 @@ import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
 import type { AndroidRequest } from "../domain/android/androidAnalysis.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { err, ok, type Result } from "../domain/result.js";
-import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
+import {
+  createJadxWorkspaceRoot,
+  type JadxWorkspaceRoot,
+} from "./JadxWorkspaceRoot.js";
 import {
   snapshotAndroidEngine,
-  hashAndroidFile,
   snapshotAndroidTarget,
 } from "./AndroidTargetSnapshot.js";
+import { hashStableFile } from "../filesystem/StableFileHash.js";
+import { RegularFileChangedError } from "../filesystem/RegularFile.js";
 import {
   inspectJadxAvailability,
-  resolveJadxConfiguration,
+  resolveJadxConfigurationInputs,
+  validateJadxConfiguration,
 } from "./JadxConfiguration.js";
 import type { JadxLauncher } from "./JadxMcpTransport.js";
 
@@ -104,9 +109,53 @@ const executionError = (context: {
   });
 };
 
+const androidTargetChanged = (
+  operation: string,
+  path: string,
+  cause?: unknown,
+): AnalysisInputError =>
+  new AnalysisInputError(
+    operation,
+    cause === undefined ? undefined : { cause },
+    [
+      {
+        path: ["path"],
+        reason: "invalid_value",
+        message: `APK bytes changed after admission at ${path}; retry against a stable file.`,
+      },
+    ],
+  );
+
+const androidSourceChanged = (
+  operation: string,
+  source: string,
+  cause?: unknown,
+): AnalysisCapabilityUnavailableError =>
+  new AnalysisCapabilityUnavailableError(
+    "jadx",
+    operation,
+    `Selected JADX input bytes changed during admission at ${source}; retry with a stable installation.`,
+    cause === undefined ? undefined : { cause },
+  );
+
+const hashAndroidSource = async (
+  path: string,
+  operation: string,
+  signal: AbortSignal,
+): Promise<string> => {
+  try {
+    return (await hashStableFile(path, signal)).sha256;
+  } catch (cause: unknown) {
+    if (signal.aborted) throw cause;
+    if (cause instanceof RegularFileChangedError)
+      throw androidSourceChanged(operation, path, cause);
+    throw cause;
+  }
+};
+
 interface PendingCleanup {
   session: JadxSession | undefined;
-  root: PrivateRuntimeRoot | undefined;
+  root: JadxWorkspaceRoot | undefined;
   readonly previousError: AnalysisError | undefined;
 }
 
@@ -147,24 +196,25 @@ const cleanup = async (
     await root?.close();
     resources.root = undefined;
   } catch (cause) {
-    return err(
-      new ProviderCleanupError(
-        "jadx",
-        [root?.path ?? "unknown"],
-        {
-          ...diagnostics,
-          reason: cause instanceof Error ? cause.message : String(cause),
-        },
-        { cause: previousError ?? cause },
-      ),
+    const error = new ProviderCleanupError(
+      "jadx",
+      [root?.path ?? "unknown"],
+      {
+        ...diagnostics,
+        reason: cause instanceof Error ? cause.message : String(cause),
+      },
+      { cause: previousError ?? cause },
     );
+    if (previousError?.partialObservation !== undefined)
+      error.retainPartialObservation(previousError.partialObservation);
+    return err(error);
   }
   return ok(undefined);
 };
 
 interface RetainedSession {
   readonly key: string;
-  readonly root: PrivateRuntimeRoot;
+  readonly root: JadxWorkspaceRoot;
   readonly session: JadxSession;
   readonly snapshot: string;
   readonly jarHash: string;
@@ -278,7 +328,7 @@ export class JadxProvider implements AndroidAnalysisPort {
       options?.signal === undefined
         ? timeout
         : AbortSignal.any([options.signal, timeout]);
-    let root: PrivateRuntimeRoot | undefined;
+    let root: JadxWorkspaceRoot | undefined;
     let session: JadxSession | undefined;
     try {
       if (target.format !== "apk")
@@ -287,23 +337,33 @@ export class JadxProvider implements AndroidAnalysisPort {
           request.operation,
           `Target ${target.path} is ${target.format}; provide one standalone APK.`,
         );
-      const configuration = await resolveJadxConfiguration(
+      const configuration = await resolveJadxConfigurationInputs(
         this.environment,
         request.operation,
         signal,
       );
       signal.throwIfAborted();
-      const jarHash = await hashAndroidFile(configuration.jar);
-      const bridgeHash = await hashAndroidFile(BRIDGE_SOURCE);
-      if ((await hashAndroidFile(target.path)) !== target.sha256)
-        throw new AnalysisInputError(request.operation, undefined, [
-          {
-            path: ["path"],
-            reason: "invalid_value",
-            message:
-              "APK bytes changed after admission; retry against a stable file.",
-          },
-        ]);
+      const jarHash = await hashAndroidSource(
+        configuration.jar,
+        request.operation,
+        signal,
+      );
+      const bridgeHash = await hashAndroidSource(
+        BRIDGE_SOURCE,
+        request.operation,
+        signal,
+      );
+      let targetHash: string;
+      try {
+        targetHash = (await hashStableFile(target.path, signal)).sha256;
+      } catch (cause: unknown) {
+        if (signal.aborted) throw cause;
+        if (cause instanceof RegularFileChangedError)
+          throw androidTargetChanged(request.operation, target.path, cause);
+        throw cause;
+      }
+      if (targetHash !== target.sha256)
+        throw androidTargetChanged(request.operation, target.path);
       const key = JSON.stringify({
         path: target.path,
         sha256: target.sha256,
@@ -326,29 +386,46 @@ export class JadxProvider implements AndroidAnalysisPort {
       }
       let retained = this.#retained;
       if (retained === undefined) {
-        root = await PrivateRuntimeRoot.create({ prefix: "rea-android-" });
+        await validateJadxConfiguration(
+          configuration,
+          this.environment,
+          request.operation,
+          signal,
+        );
+        root = await createJadxWorkspaceRoot();
+        const workspaceSignal =
+          root.failureSignal === undefined
+            ? signal
+            : AbortSignal.any([signal, root.failureSignal]);
         const engine = await snapshotAndroidEngine(
           configuration.jar,
           jarHash,
           root.path,
           request.operation,
+          workspaceSignal,
         );
         const snapshot = await snapshotAndroidTarget(
           target.path,
           target.sha256,
           root.path,
           request.operation,
+          workspaceSignal,
         );
         const bridge = join(root.path, "ReaJadxBridge.java");
         await copyFile(BRIDGE_SOURCE, bridge);
         await chmod(bridge, 0o400);
-        if ((await hashAndroidFile(bridge)) !== bridgeHash)
-          throw new AnalysisCapabilityUnavailableError(
-            "jadx",
+        const copiedBridgeHash = await hashAndroidSource(
+          bridge,
+          request.operation,
+          workspaceSignal,
+        );
+        if (copiedBridgeHash !== bridgeHash)
+          throw androidSourceChanged(
             request.operation,
-            "REA Android bridge bytes changed during admission; retry with a stable installation.",
+            BRIDGE_SOURCE,
+            undefined,
           );
-        signal.throwIfAborted();
+        workspaceSignal.throwIfAborted();
         session = new JadxSession(
           {
             command: configuration.java,
@@ -360,7 +437,7 @@ export class JadxProvider implements AndroidAnalysisPort {
             ],
             cwd: root.path,
             hostEnvironment: this.environment,
-            signal,
+            signal: workspaceSignal,
           },
           this.launcher,
         );
@@ -375,6 +452,10 @@ export class JadxProvider implements AndroidAnalysisPort {
       }
       root = retained.root;
       session = retained.session;
+      const activeSignal =
+        root.failureSignal === undefined
+          ? signal
+          : AbortSignal.any([signal, root.failureSignal]);
       const { snapshot } = retained;
       const outcome = ok(
         await session.execute({
@@ -383,10 +464,10 @@ export class JadxProvider implements AndroidAnalysisPort {
           snapshot,
           jarHash: retained.jarHash,
           bridgeHash: retained.bridgeHash,
-          signal,
+          signal: activeSignal,
         }),
       );
-      signal.throwIfAborted();
+      activeSignal.throwIfAborted();
       this.#retained = retained;
       return outcome;
     } catch (cause) {

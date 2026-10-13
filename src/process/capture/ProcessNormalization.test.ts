@@ -59,17 +59,67 @@ const scenario = (normalization: {
   readonly pids?: boolean;
   readonly paths?: boolean;
   readonly ports?: boolean;
+  readonly patterns?: readonly {
+    readonly pattern: string;
+    readonly replacement: string;
+  }[];
 }) =>
   parseProcessScenario({
     executable: "/usr/bin/node",
     working_directory: "/workspace",
     normalization: {
       paths: true,
-      ...normalization,
       time_bucket_ms: 10,
       patterns: [{ pattern: "marker", replacement: "selected" }],
+      ...normalization,
     },
   });
+
+it("replaces caller-declared patterns literally, without expanding replacement patterns", () => {
+  const declared = scenario({
+    paths: false,
+    patterns: [
+      { pattern: "8080", replacement: "$&$&" },
+      { pattern: "READY", replacement: "$$" },
+      { pattern: "NAME", replacement: "$1" },
+    ],
+  });
+  expect(
+    normalizeProcessText(
+      "listening on 8080; READY; NAME=alpha; tail NAME",
+      declared,
+      "/temporary",
+      rootPid,
+    ),
+  ).toBe("listening on $&$&; $$; $1=alpha; tail $1");
+});
+
+it("preserves empty-pattern boundaries, including empty text", () => {
+  const declared = scenario({
+    patterns: [{ pattern: "", replacement: "$$" }],
+  });
+  expect(normalizeProcessText("ab", declared, "/temporary", rootPid)).toBe(
+    "$$a$$b$$",
+  );
+  expect(normalizeProcessText("", declared, "/temporary", rootPid)).toBe("$$");
+});
+
+it.each(["$`", "$'"])(
+  "retains the selected replacement %s verbatim",
+  (replacement) => {
+    const declared = scenario({
+      patterns: [{ pattern: "marker", replacement }],
+    });
+    expect(
+      normalizeProcessText(
+        "before marker after",
+        declared,
+        "/temporary",
+        rootPid,
+      ),
+    ).toBe(`before ${replacement} after`);
+  },
+);
 
 it("preserves compact JSON, counters, line numbers, and ambiguous endpoint spellings", () => {
   const input = [
@@ -214,5 +264,49 @@ it("normalizes representative process identities and preserves null, zero, and u
   ]);
   expect(identifiersPreserved[1]?.command).toBe(
     "<working-directory>/program child 42020 parent 41010 group 43030 session 44040 listen:<port> selected",
+  );
+});
+
+it("normalizes nested paths once using the most specific selected identity", () => {
+  const declared = parseProcessScenario({
+    executable: "/workspace/project/bin/program",
+    working_directory: "/workspace/project",
+    filesystem_observation_paths: [
+      "/workspace/project/data",
+      "/workspace/project/data/cache",
+    ],
+    normalization: { paths: true, pids: false, ports: false, patterns: [] },
+  });
+  expect(
+    normalizeProcessText(
+      "/workspace/project/bin/program /workspace/project/data/cache/item /workspace/project/data/result /workspace/project/log /workspace/tmp",
+      declared,
+      "/workspace",
+      rootPid,
+    ),
+  ).toBe(
+    "<executable> <filesystem-root-1>/item <filesystem-root-0>/result <working-directory>/log <temporary-root>/tmp",
+  );
+});
+
+it("treats path metacharacters literally while preferring nested observed roots", () => {
+  const declared = parseProcessScenario({
+    executable: "/selected/[tool]+",
+    working_directory: "/selected",
+    filesystem_observation_paths: [
+      "/selected/(data)",
+      "/selected/(data)/cache",
+    ],
+    normalization: { paths: true, pids: false, ports: false, patterns: [] },
+  });
+  expect(
+    normalizeProcessText(
+      "/selected/[tool]+ /selected/(data)/cache/item /selected/(data)/file /selected/log /selected/toolll",
+      declared,
+      "/tmp",
+      rootPid,
+    ),
+  ).toBe(
+    "<executable> <filesystem-root-1>/item <filesystem-root-0>/file <working-directory>/log <working-directory>/toolll",
   );
 });

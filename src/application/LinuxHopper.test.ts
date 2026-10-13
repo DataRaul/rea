@@ -7,6 +7,7 @@ import {
   linuxPackageManagerCommands,
   linuxSharedLibrariesAvailable,
   parseLinuxDistribution,
+  supportsReaHost,
   type LinuxDistribution,
   type LinuxHopperDownload,
   type LinuxHopperInstallHost,
@@ -19,7 +20,7 @@ class RecordingLinuxHost implements LinuxHopperInstallHost {
     id: "ubuntu",
     versionId: "24.04",
     packageFamily: "deb",
-    supported: true,
+    hopperSetupSupported: true,
   };
   archive = new Uint8Array([1, 2, 3]);
   archiveOk = true;
@@ -60,12 +61,16 @@ describe("Linux Hopper host classification", () => {
     ['ID=nobara\nVERSION_ID="44"\nID_LIKE="rhel centos fedora"\n', "rpm"],
     ["ID=arch\n", "arch"],
     ["ID=cachyos\nID_LIKE=arch\n", "arch"],
-  ] as const)("accepts an official Hopper distribution", (document, family) => {
-    expect(parseLinuxDistribution(document)).toMatchObject({
-      packageFamily: family,
-      supported: true,
-    });
-  });
+    ['ID=omarchy\nID_LIKE=arch\nVERSION_ID="4.0.4"\n', "arch"],
+  ] as const)(
+    "accepts an explicitly supported distribution",
+    (document, family) => {
+      expect(parseLinuxDistribution(document)).toMatchObject({
+        packageFamily: family,
+        hopperSetupSupported: true,
+      });
+    },
+  );
 
   it("detects unresolved or loader-reported shared libraries", () => {
     expect(
@@ -93,8 +98,34 @@ describe("Linux Hopper host classification", () => {
     'ID=debian\nVERSION_ID="13"\nID_LIKE=debian\n',
     "ID=manjaro\nID_LIKE=arch\n",
     "ID=garuda\nID_LIKE=arch\n",
-  ])("rejects unsupported vendor/version combinations", (document) => {
-    expect(parseLinuxDistribution(document).supported).toBe(false);
+    "ID=omarchy\n",
+    "ID=omarchy\nID_LIKE=debian\n",
+  ])(
+    "rejects vendor/version combinations without a tested Hopper installer",
+    (document) => {
+      expect(parseLinuxDistribution(document).hopperSetupSupported).toBe(false);
+    },
+  );
+
+  it.each([
+    'ID=kali\nVERSION_ID="2026.3"\nID_LIKE=debian\n',
+    'ID=debian\nVERSION_ID="13"\nID_LIKE=debian\n',
+    'ID=linuxmint\nVERSION_ID="22.1"\nID_LIKE="ubuntu debian"\n',
+    "ID=manjaro\nID_LIKE=arch\n",
+    "ID=derivative\nID_LIKE='debian'\n",
+    "ID='debian'\nVERSION_ID='13'\n",
+  ])(
+    "hosts REA on a distribution Hopper has no tested package for: %s",
+    (document) => {
+      const distribution = parseLinuxDistribution(document);
+      expect(distribution.hopperSetupSupported).toBe(false);
+      expect(supportsReaHost(distribution)).toBe(true);
+    },
+  );
+
+  it("withholds host support from a distribution with no package family", () => {
+    expect(supportsReaHost(parseLinuxDistribution("ID=nixos\n"))).toBe(false);
+    expect(supportsReaHost(undefined)).toBe(false);
   });
 });
 
@@ -160,7 +191,7 @@ describe("Linux Hopper installation", () => {
       host.distributionValue = {
         id: family,
         packageFamily: family,
-        supported: true,
+        hopperSetupSupported: true,
       };
       const result = await installFixture(host);
       expect(result).toEqual({
@@ -188,7 +219,7 @@ describe("Linux Hopper installation", () => {
       host.distributionValue = {
         id: "debian",
         packageFamily: "deb",
-        supported: false,
+        hopperSetupSupported: false,
       };
     if (scenario === "package request failure") host.archiveOk = false;
     if (scenario === "checksum mismatch") host.archive = new Uint8Array([9]);

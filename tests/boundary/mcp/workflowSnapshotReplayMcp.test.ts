@@ -1,6 +1,6 @@
 import { parseConfig } from "../../../src/config/parseConfig.js";
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { access, chmod, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,9 +21,11 @@ import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { createAnalysisProfile } from "../../../src/domain/analysisProfile.js";
 import { readAnalysisSnapshot } from "../../../src/application/binary/AnalysisSnapshotFiles.js";
 import { ok } from "../../../src/domain/result.js";
+import { evidenceBundleSchema } from "../../../src/domain/evidenceBundle.js";
 import { silentLogger } from "../../../src/logger.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { toolContract } from "../../../src/contracts/toolContracts.js";
+import { recordUnknownInputSchema } from "../../../src/domain/residualUnknown.js";
 
 const identity = { id: "fixture", name: "Fixture", version: "1" } as const;
 const profile = createAnalysisProfile(identity, { fixture: true });
@@ -38,6 +40,114 @@ const resources: Array<{ close(): Promise<unknown> }> = [];
 
 afterEach(async () => {
   await Promise.all(resources.splice(0).map((resource) => resource.close()));
+});
+
+describe("MCP external command snapshot retirement", () => {
+  it.skipIf(process.platform === "win32")(
+    "rejects a queued snapshot after mutation and preserves Evidence through explicit reopening",
+    async () => {
+      const { targetPaths, snapshotPath } = await createWorkflowFiles(
+        "rea-mcp-admitted-reverse-",
+        ["target.hop"],
+      );
+      const targetPath = targetPaths[0];
+      if (targetPath === undefined)
+        throw new Error("Expected one workflow target");
+      const fixtureDirectory = dirname(snapshotPath);
+      const startedPath = join(fixtureDirectory, "rizin-started");
+      const releasePath = join(fixtureDirectory, "rizin-release");
+      const providerPath = join(fixtureDirectory, "rizin-fixture.mjs");
+      await writeFile(
+        providerPath,
+        `#!${process.execPath}\nimport { existsSync, writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(startedPath)}, "started");\nwhile (!existsSync(${JSON.stringify(releasePath)})) await new Promise((resolve) => setTimeout(resolve, 5));\nprocess.stdout.write("Rizin fixture output\\n");\n`,
+      );
+      await chmod(providerPath, 0o755);
+      const session = createWorkflowSession(makeProvider([], []));
+      const { mcp } = await connectWorkflowMcp(
+        session,
+        "admitted-reverse-engineering",
+        { REA_RIZIN_COMMAND: providerPath },
+      );
+      await openWorkflowTarget(mcp, targetPath);
+
+      const analysisRequest = mcp.callTool({
+        name: "execute_rizin_command",
+        arguments: { path: targetPath, command: "iI" },
+      });
+      const readyDeadline = Date.now() + 5_000;
+      while (Date.now() < readyDeadline) {
+        try {
+          await access(startedPath);
+          break;
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
+      await expect(access(startedPath)).resolves.toBeUndefined();
+
+      let closeSettled = false;
+      const closeRequest = mcp
+        .callTool({
+          name: "close_binary",
+          arguments: { snapshot_path: snapshotPath },
+        })
+        .finally(() => {
+          closeSettled = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(closeSettled).toBe(false);
+      await expect(access(snapshotPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      await writeFile(releasePath, "release");
+      const analyzed = await analysisRequest;
+      expect(analyzed.isError, JSON.stringify(analyzed.content)).not.toBe(true);
+      const evidence = toolContract("execute_rizin_command").outputSchema.parse(
+        analyzed.structuredContent,
+      );
+      const closed = await closeRequest;
+      expect(closed.isError).toBe(true);
+      expect(JSON.stringify(closed.content)).toContain(
+        "Analysis snapshots are unavailable",
+      );
+      expect(session.activeTarget()).toBeUndefined();
+      await expect(access(snapshotPath)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      const exported = await mcp.callTool({
+        name: "export_evidence_bundle",
+        arguments: { path: join(fixtureDirectory, "observations.json") },
+      });
+      expect(exported.isError ?? false).toBe(false);
+      const observations = evidenceBundleSchema.parse(
+        JSON.parse(
+          await readFile(join(fixtureDirectory, "observations.json"), "utf8"),
+        ),
+      );
+      expect(observations.records).toContainEqual(
+        expect.objectContaining({ evidence_id: evidence.evidence_id }),
+      );
+
+      // The provider process has completed; explicitly open fresh analysis
+      // before saving an immutable snapshot of the new binding.
+      await openWorkflowTarget(mcp, targetPath);
+      const saved = await mcp.callTool({
+        name: "close_binary",
+        arguments: { snapshot_path: snapshotPath },
+      });
+      expect(saved.isError ?? false).toBe(false);
+      const snapshot = await readAnalysisSnapshot(snapshotPath);
+      if (!snapshot.ok) throw snapshot.error;
+      expect(snapshot.value.evidence_bundle.records).toContainEqual(
+        expect.objectContaining({
+          evidence_id: evidence.evidence_id,
+          operation: "execute_rizin_command",
+          subject: expect.objectContaining({ local_path: targetPath }),
+        }),
+      );
+    },
+  );
 });
 
 describe("MCP composed workflow target admission", () => {
@@ -135,6 +245,20 @@ describe("MCP composed workflow snapshot replay", () => {
       })
       .passthrough()
       .parse(output);
+    const primitiveResult = await mcp.callTool({
+      name: "list_strings",
+      arguments: { document: "fixture" },
+    });
+    expect(
+      primitiveResult.isError,
+      JSON.stringify(primitiveResult.content),
+    ).not.toBe(true);
+    const primitiveEvidence = toolContract("list_strings").outputSchema.parse(
+      primitiveResult.structuredContent,
+    );
+    expect(primitiveEvidence).toMatchObject({
+      subject: { local_path: targetPath },
+    });
     const afterAnalysisCalls = [...calls];
     const afterAnalysisStarts = [...starts];
 
@@ -162,6 +286,47 @@ describe("MCP composed workflow snapshot replay", () => {
       }),
     );
 
+    const relocatedPath = join(dirname(targetPath), "relocated.hop");
+    await writeFile(relocatedPath, "fixture.hop");
+    const reopened = await mcp.callTool({
+      name: "open_binary",
+      arguments: { path: relocatedPath, snapshot_path: snapshotPath },
+    });
+    expect(reopened.isError, JSON.stringify(reopened.content)).not.toBe(true);
+    const cachedPrimitive = await mcp.callTool({
+      name: "list_strings",
+      arguments: { document: "fixture" },
+    });
+    expect(
+      cachedPrimitive.isError,
+      JSON.stringify(cachedPrimitive.content),
+    ).not.toBe(true);
+    const cachedEvidence = toolContract("list_strings").outputSchema.parse(
+      cachedPrimitive.structuredContent,
+    );
+    expect(cachedEvidence).toMatchObject({
+      subject: { local_path: relocatedPath },
+    });
+    expect(cachedEvidence.normalized_result).toEqual(
+      primitiveEvidence.normalized_result,
+    );
+    expect(cachedEvidence.raw_result).toEqual(primitiveEvidence.raw_result);
+    const retained = await mcp.callTool({
+      name: "get_evidence_bundle",
+      arguments: {},
+    });
+    expect(retained.isError, JSON.stringify(retained.content)).not.toBe(true);
+    const retainedBundle = toolContract(
+      "get_evidence_bundle",
+    ).outputSchema.parse(retained.structuredContent).result;
+    expect(
+      retainedBundle.records.find(
+        ({ evidence_id }) => evidence_id === primitiveEvidence.evidence_id,
+      )?.subject?.local_path,
+    ).toBe(targetPath);
+    expect(calls).toEqual(afterAnalysisCalls);
+    expect(starts).toEqual(afterAnalysisStarts);
+
     const dependencies: DirectAnalysisDependencies = {
       readConfiguration: () => parseConfig({}),
       createBinarySession: () => createWorkflowSession(provider),
@@ -179,7 +344,9 @@ describe("MCP composed workflow snapshot replay", () => {
     expect(calls).toEqual(afterAnalysisCalls);
     expect(starts).toEqual(afterAnalysisStarts);
   });
+});
 
+describe("MCP live workflow snapshot policy", () => {
   it("does not bind a workflow when an upstream operation is live", async () => {
     const { targetPaths, snapshotPath } = await createWorkflowFiles(
       "rea-mcp-live-workflow-snapshot-",
@@ -217,6 +384,153 @@ describe("MCP composed workflow snapshot replay", () => {
   });
 });
 
+describe("MCP investigation history snapshot replay", () => {
+  it.each(["verified", "withdrawn", "out-of-scope"] as const)(
+    "preserves a target's %s resolution recorded while another target is active",
+    async (disposition) => {
+      const { targetPaths, snapshotPath } = await createWorkflowFiles(
+        "rea-mcp-investigation-history-",
+        ["first.hop", "second.hop"],
+      );
+      const firstPath = targetPaths[0];
+      const secondPath = targetPaths[1];
+      if (firstPath === undefined || secondPath === undefined)
+        throw new Error("Expected two investigation targets");
+      const session = createWorkflowSession(makeProvider([], []));
+      const { mcp } = await connectWorkflowMcp(
+        session,
+        "investigation-history",
+      );
+      await openWorkflowTarget(mcp, firstPath);
+      const input = recordUnknownInputSchema.parse({
+        question: "Has the string inventory been inspected for this target?",
+        severity: "medium",
+        domain: "investigation-history",
+        required_authority: null,
+        required_confidence: "derived",
+        required_environment: null,
+        recommended_probes: [],
+        relationships: [],
+      });
+      const recorded = await mcp.callTool({
+        name: "record_unknown",
+        arguments: input,
+      });
+      expect(recorded.isError).not.toBe(true);
+      const unknown = toolContract("record_unknown").outputSchema.parse(
+        recorded.structuredContent,
+      ).result;
+      const resolutionEvidenceIds: string[] = [];
+      if (disposition === "verified") {
+        const inspected = await mcp.callTool({
+          name: "list_strings",
+          arguments: {},
+        });
+        expect(inspected.isError, JSON.stringify(inspected.content)).not.toBe(
+          true,
+        );
+        resolutionEvidenceIds.push(
+          z
+            .string()
+            .parse(
+              toolContract("list_strings").outputSchema.parse(
+                inspected.structuredContent,
+              ).evidence_id,
+            ),
+        );
+      }
+      await openWorkflowTarget(mcp, secondPath);
+      const unrelated = await mcp.callTool({
+        name: "list_strings",
+        arguments: {},
+      });
+      expect(unrelated.isError).not.toBe(true);
+      const foreignEvidence = toolContract("list_strings").outputSchema.parse(
+        unrelated.structuredContent,
+      );
+      const updateInput = {
+        unknown_id: unknown.unknown_id,
+        expected_revision: unknown.revision,
+        status: "resolved",
+        severity: input.severity,
+        supporting_evidence_ids: resolutionEvidenceIds,
+        contradicting_evidence_ids: input.contradicting_evidence_ids,
+        required_authority: input.required_authority,
+        required_confidence: input.required_confidence,
+        required_environment: input.required_environment,
+        recommended_probes: input.recommended_probes,
+        relationships: input.relationships,
+        resolution: {
+          disposition,
+          rationale: "Disposition recorded after further investigation.",
+          evidence_ids: resolutionEvidenceIds,
+        },
+      };
+      const updated = await mcp.callTool({
+        name: "update_unknown",
+        arguments: updateInput,
+      });
+      expect(updated.isError, JSON.stringify(updated.content)).not.toBe(true);
+      const resolved = toolContract("update_unknown").outputSchema.parse(
+        updated.structuredContent,
+      ).result;
+      expect(resolved).toMatchObject({
+        revision: 2,
+        status: "resolved",
+        scope_digest: unknown.scope_digest,
+      });
+      await openWorkflowTarget(mcp, firstPath);
+      const closed = await mcp.callTool({
+        name: "close_binary",
+        arguments: { snapshot_path: snapshotPath },
+      });
+      expect(closed.isError, JSON.stringify(closed.content)).not.toBe(true);
+      const snapshot = await readAnalysisSnapshot(snapshotPath);
+      if (!snapshot.ok) throw snapshot.error;
+      expect(snapshot.value.evidence_bundle.unknowns).toEqual([
+        unknown,
+        resolved,
+      ]);
+      expect(snapshot.value.evidence_bundle.records).toContainEqual(
+        expect.objectContaining({
+          operation: "update_unknown",
+          parameters: updateInput,
+          subject: expect.objectContaining({ local_path: secondPath }),
+        }),
+      );
+      expect(snapshot.value.evidence_bundle.records).not.toContainEqual(
+        foreignEvidence,
+      );
+
+      const replay = createWorkflowSession(makeProvider([], []));
+      const { mcp: replayMcp } = await connectWorkflowMcp(
+        replay,
+        "investigation-history-replay",
+      );
+      const reopened = await replayMcp.callTool({
+        name: "open_binary",
+        arguments: { path: firstPath, snapshot_path: snapshotPath },
+      });
+      expect(reopened.isError, JSON.stringify(reopened.content)).not.toBe(true);
+      const listed = await replayMcp.callTool({
+        name: "list_unknowns",
+        arguments: {},
+      });
+      expect(listed.isError).not.toBe(true);
+      expect(
+        toolContract("list_unknowns").outputSchema.parse(
+          listed.structuredContent,
+        ).result,
+      ).toEqual({
+        items: [resolved],
+        total: 1,
+        offset: 0,
+        next_offset: null,
+      });
+    },
+  );
+});
+
 const createWorkflowFiles = async (
   prefix: string,
   filenames: readonly string[],
@@ -243,10 +557,14 @@ const createWorkflowSession = (provider: AnalysisProvider) =>
 const connectWorkflowMcp = async (
   session: ReturnType<typeof createWorkflowSession>,
   clientName: string,
+  providerEnvironment?: Readonly<NodeJS.ProcessEnv>,
 ): Promise<{ readonly mcp: Client }> => {
   const server = createServer(
     { kind: "session", session },
-    { logger: silentLogger },
+    {
+      logger: silentLogger,
+      ...(providerEnvironment === undefined ? {} : { providerEnvironment }),
+    },
   );
   const mcp = new Client({ name: clientName, version: "1.0.0" });
   const [clientTransport, serverTransport] =
@@ -322,7 +640,7 @@ const makeProvider = (
                   ? ["fixture"]
                   : operation === "list_procedures"
                     ? ["0x1000"]
-                    : { "0x1000": "fixture" };
+                    : [{ address: "0x1000", value: "fixture" }];
           return ok(createAnalysisExecution(result, identity));
         },
         close: () => Promise.resolve(ok(null)),

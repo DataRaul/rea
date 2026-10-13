@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 
-import { readCliJsonFile } from "./cliJsonFile.js";
+import { readJsonInputFile } from "./application/JsonInputFile.js";
 import { NonRegularFileReadError } from "./filesystem/RegularFile.js";
 import {
   AnalysisAccessDeniedError,
@@ -21,7 +21,7 @@ export const parseCliJsonInput = async (
   const inline = safeParseJson(value);
   if (inline.ok) return { ok: true, value: inline.value };
   try {
-    const parsed = await readCliJsonFile(value, operation);
+    const parsed = await readJsonInputFile(value, operation);
     return parsed.ok
       ? { ok: true, value: parsed.value }
       : {
@@ -66,11 +66,18 @@ const accessDeniedSystemCode = (
 };
 
 /**
+ * A `file:` URL or `scheme://` URL is not an operator-relative filesystem path.
+ * One-letter prefixes stay paths so Windows drive paths resolve normally.
+ */
+const URL_REFERENCE = /^(?:file:|[A-Za-z][A-Za-z0-9+.-]+:\/\/)/iu;
+
+/**
  * Resolve named string fields of CLI-supplied JSON against the operator
  * working directory. Each entry is a key path from the document root; only
- * fields holding nonblank strings are resolved, everything else passes through
- * untouched so shared schemas can reject blank paths. Shared MCP contracts reject
- * relative paths, so CLI workflows resolve operator-relative values before validation.
+ * fields holding nonblank, non-URL strings are resolved, everything else passes
+ * through untouched so shared schemas can reject blank paths and URLs. Shared MCP
+ * contracts reject relative paths, so CLI workflows resolve operator-relative
+ * values before validation.
  */
 export const resolveCliJsonPaths = (
   value: unknown,
@@ -94,7 +101,9 @@ const resolveJsonPath = (
       if (tail.length === 0)
         return [
           key,
-          typeof entry === "string" && entry.trim().length > 0
+          typeof entry === "string" &&
+          entry.trim().length > 0 &&
+          !URL_REFERENCE.test(entry)
             ? resolve(entry)
             : entry,
         ];

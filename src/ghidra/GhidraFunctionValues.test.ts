@@ -4,6 +4,11 @@ import type { JsonValue } from "../domain/jsonValue.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { functionDossierSchema } from "../domain/hopperValues.js";
 import {
+  compactReference,
+  compactInstruction,
+  compactCallTargets,
+} from "../domain/native/nativeInstruction.fixture.js";
+import {
   parseGhidraFunctionResult,
   type GhidraFunctionOperation,
 } from "./GhidraFunctionValues.js";
@@ -15,7 +20,106 @@ import {
   ghidraReferenceEdge,
 } from "../domain/ghidraValues.fixture.js";
 
+const observationOperations: ReadonlySet<GhidraFunctionOperation> = new Set([
+  "analyze_function",
+  "procedure_assembly",
+  "procedure_callees",
+  "procedure_callers",
+  "procedure_info",
+  "procedure_pseudo_code",
+  "read_function_instructions",
+]);
+
+// Existing assertions focus on the value schema; this helper builds the current
+// bridge envelope and returns its normalized value for those assertions.
+const parseFunctionValueFixture = (
+  operation: GhidraFunctionOperation,
+  value: JsonValue,
+) => {
+  const wireValue = observationOperations.has(operation)
+    ? { value, limitations: [] }
+    : value;
+  const parsed = parseGhidraFunctionResult(operation, wireValue);
+  return parsed.ok ? { ok: true as const, value: parsed.value.value } : parsed;
+};
+
 describe("Ghidra function-analysis result values", () => {
+  it("preserves file-offset resolution in Evidence locations and rejects inexact offsets", () => {
+    const selection = {
+      file_offset: 0x210,
+      mapped_address: "0x140001010",
+      procedure_address: "0x140001010",
+    };
+    const wire = { value: "return 42;", limitations: [], selection };
+    expect(parseGhidraFunctionResult("procedure_assembly", wire)).toMatchObject(
+      { ok: false, error: { _tag: "AnalysisOutputError" } },
+    );
+    const parsed = parseGhidraFunctionResult("procedure_pseudo_code", wire);
+    if (!parsed.ok) throw parsed.error;
+    expect(parsed.value.locations).toEqual([
+      { kind: "file-offset", offset: 0x210 },
+      { kind: "address", address: "0x140001010" },
+      { kind: "address", address: "0x140001010" },
+    ]);
+    expect(
+      parseGhidraFunctionResult("procedure_pseudo_code", {
+        ...wire,
+        selection: { ...selection, file_offset: Number.MAX_SAFE_INTEGER + 1 },
+      }),
+    ).toMatchObject({ ok: false, error: { _tag: "AnalysisOutputError" } });
+  });
+  it.each([...observationOperations])(
+    "requires the function-observation limitations envelope for %s",
+    (operation) => {
+      expect(parseGhidraFunctionResult(operation, null)).toMatchObject({
+        ok: false,
+        error: { _tag: "AnalysisOutputError" },
+      });
+    },
+  );
+
+  it("preserves a named function-observation limitation", () => {
+    expect(
+      parseGhidraFunctionResult("procedure_pseudo_code", "void f() {}"),
+    ).toMatchObject({ ok: false, error: { _tag: "AnalysisOutputError" } });
+    const limitation =
+      "Ghidra marks a call to external __tls_get_addr terminal; return behavior is not independently verified.";
+    expect(
+      parseGhidraFunctionResult("procedure_pseudo_code", {
+        value: "void f() {}",
+        limitations: [limitation],
+      }),
+    ).toEqual({
+      ok: true,
+      value: { value: "void f() {}", limitations: [limitation] },
+    });
+  });
+
+  it.each(["procedure_callees", "procedure_callers"] as const)(
+    "requires the function-observation envelope to carry terminal-call limitations for %s",
+    (operation) => {
+      // A bare address list is the pre-fix bridge shape; without the envelope
+      // a truncated function body reports no warning, so it must be rejected.
+      expect(parseGhidraFunctionResult(operation, ["0x2000"])).toMatchObject({
+        ok: false,
+        error: { _tag: "AnalysisOutputError" },
+      });
+      const limitation =
+        "Ghidra Listing reports a terminal call at 0x401000 to 0x402000 abort; fallthrough is excluded by Ghidra's flow model.";
+      expect(
+        parseGhidraFunctionResult(operation, {
+          value: ["0x2000"],
+          limitations: [limitation],
+        }),
+      ).toEqual({
+        ok: true,
+        value: { value: ["0x2000"], limitations: [limitation] },
+      });
+    },
+  );
+});
+
+describe("Ghidra reference and value-flow completeness", () => {
   it.each(["reference_kinds_available", "unresolved_calls"])(
     "rejects omitted %s instead of inventing complete reference observations",
     (field) => {
@@ -30,10 +134,10 @@ describe("Ghidra function-analysis result values", () => {
         Object.entries(output).filter(([key]) => key !== field),
       );
       expect(
-        parseGhidraFunctionResult("procedure_references", output),
+        parseFunctionValueFixture("procedure_references", output),
       ).toMatchObject({ ok: true });
       expect(
-        parseGhidraFunctionResult("procedure_references", incomplete),
+        parseFunctionValueFixture("procedure_references", incomplete),
       ).toMatchObject({ ok: false, error: { _tag: "AnalysisOutputError" } });
     },
   );
@@ -75,7 +179,7 @@ describe("Ghidra function-analysis result values", () => {
             );
 
       expect(
-        parseGhidraFunctionResult(
+        parseFunctionValueFixture(
           "analyze_function",
           jsonValueSchema.parse({
             ...dossier,
@@ -98,7 +202,7 @@ describe("Ghidra function-analysis result values", () => {
     if (typeof flow !== "object" || flow === null || Array.isArray(flow))
       throw new TypeError("Ghidra p-code fixture is invalid");
     expect(
-      parseGhidraFunctionResult("analyze_function", {
+      parseFunctionValueFixture("analyze_function", {
         ...dossier,
         native_value_flow: {
           ...flow,
@@ -116,6 +220,159 @@ describe("Ghidra function-analysis result values", () => {
       error: { _tag: "AnalysisOutputError" },
     });
   });
+});
+
+describe("Ghidra Swift String literals", () => {
+  it("keeps a small Swift literal without storage apart from a large literal's bytes", () => {
+    const dossier = ghidraFunctionDossier();
+    if (
+      typeof dossier !== "object" ||
+      dossier === null ||
+      Array.isArray(dossier)
+    )
+      throw new TypeError("Ghidra dossier fixture is invalid");
+    const literals = [
+      {
+        source_address: "0x401004",
+        value: "The user name ",
+        representation: "small",
+        address: null,
+        registers: ["x0", "x1"],
+        words: ["0x7265737520656854", "0xee0020656d616e20"],
+      },
+      {
+        source_address: "0x401006",
+        value: "",
+        representation: "small",
+        address: null,
+        registers: ["x0", "x1"],
+        words: ["0x0", "0xe000000000000000"],
+      },
+      {
+        source_address: "0x401008",
+        value: " cannot be written into a sudoers rule safely.",
+        representation: "large",
+        address: "0x402270",
+        registers: ["x0", "x1"],
+        words: ["0xd00000000000002e", "0x8000000000402250"],
+      },
+    ];
+    expect(
+      parseFunctionValueFixture("analyze_function", {
+        ...dossier,
+        swift_string_literals: literals,
+        swift_string_literal_omissions: [],
+      }),
+    ).toMatchObject({ ok: true, value: { swift_string_literals: literals } });
+  });
+});
+
+describe("Ghidra compact reference provenance", () => {
+  it("distinguishes incoming references, examined emptiness and unavailable coverage at data addresses", () => {
+    const instruction = {
+      ...compactInstruction(),
+      address: "ram:00402000",
+      status: "data",
+      procedure: null,
+    };
+    const reference = {
+      ...compactReference(),
+      source_address: "ram:00401000",
+      target_address: instruction.address,
+      type: "WRITE",
+      call: false,
+      data: true,
+      write: true,
+    };
+    for (const incoming of [
+      {},
+      { incoming_references: null },
+      { incoming_references: [] },
+      { incoming_references: [reference] },
+      { incoming_references: [{ ...reference, primary: null, source: null }] },
+    ]) {
+      const expected = { ...instruction, ...incoming };
+      const parsed = parseFunctionValueFixture(
+        "inspect_native_instruction",
+        expected,
+      );
+      if (!parsed.ok) throw parsed.error;
+      expect(parsed.value).toEqual(expected);
+    }
+    expect(
+      parseFunctionValueFixture("inspect_native_instruction", {
+        ...instruction,
+        incoming_references: [{ ...reference, primary: "false" }],
+      }),
+    ).toMatchObject({ ok: false, error: { _tag: "AnalysisOutputError" } });
+  });
+
+  const operations = [
+    ["inspect_native_instruction", compactInstruction],
+    ["resolve_native_call_targets", compactCallTargets],
+  ] as const;
+
+  it.each(operations)(
+    "preserves complete, legacy and unknown facts in %s",
+    (operation, output) => {
+      const complete = compactReference();
+      const legacy = Object.fromEntries(
+        Object.entries(complete).filter(
+          ([key]) =>
+            ![
+              "source_address",
+              "data",
+              "read",
+              "write",
+              "primary",
+              "provenance",
+              "source",
+            ].includes(key),
+        ),
+      );
+      const unknown = {
+        ...legacy,
+        source_address: null,
+        data: null,
+        read: null,
+        write: null,
+        primary: null,
+        provenance: null,
+        source: null,
+      };
+      for (const reference of [complete, legacy, unknown]) {
+        const expected = output([reference]);
+        const parsed = parseFunctionValueFixture(operation, expected);
+        if (!parsed.ok) throw parsed.error;
+        expect(parsed.value).toEqual(expected);
+      }
+    },
+  );
+
+  it.each(operations)(
+    "rejects malformed present provenance in %s",
+    (operation, output) => {
+      for (const [field, value] of [
+        ["source_address", 1],
+        ["data", "true"],
+        ["read", 1],
+        ["write", 0],
+        ["primary", "false"],
+        ["provenance", ""],
+        ["source", false],
+      ] as const) {
+        expect(
+          parseFunctionValueFixture(
+            operation,
+            output([{ ...compactReference(), [field]: value }]),
+          ),
+        ).toMatchObject({
+          ok: false,
+          error: { _tag: "AnalysisOutputError" },
+        });
+      }
+    },
+  );
 });
 
 describe("Ghidra jump-table mapping contract", () => {
@@ -141,7 +398,7 @@ describe("Ghidra jump-table mapping contract", () => {
         ],
       },
     ];
-    const parsed = parseGhidraFunctionResult("analyze_function", {
+    const parsed = parseFunctionValueFixture("analyze_function", {
       ...dossier,
       native_api: {
         ...boundary,
@@ -181,7 +438,7 @@ describe("Ghidra jump-table mapping contract", () => {
       throw new TypeError("Ghidra jump-table fixture is unavailable");
     const { default_targets: omittedDefaults, ...withoutDefaults } = table;
     expect(omittedDefaults).toHaveLength(1);
-    const parsed = parseGhidraFunctionResult("analyze_function", {
+    const parsed = parseFunctionValueFixture("analyze_function", {
       ...dossier,
       native_api: {
         ...boundary,
@@ -214,7 +471,7 @@ describe("Ghidra jump-table mapping contract", () => {
       { target_address: "0x401020", confidence: "high", evidence: [] },
     ]) {
       expect(
-        parseGhidraFunctionResult("analyze_function", {
+        parseFunctionValueFixture("analyze_function", {
           ...dossier,
           native_api: {
             ...boundary,
@@ -230,13 +487,41 @@ describe("Ghidra function-analysis malformed results", () => {
   it.each(malformedOutputs())(
     "rejects malformed %s output",
     (_name, operation, value) => {
-      expect(parseGhidraFunctionResult(operation, value)).toMatchObject({
+      expect(parseFunctionValueFixture(operation, value)).toMatchObject({
         ok: false,
         error: { _tag: "AnalysisOutputError" },
       });
     },
   );
 });
+
+const malformedSwiftStringLiterals = (
+  dossier: Record<string, JsonValue>,
+): Array<[string, GhidraFunctionOperation, JsonValue]> =>
+  (
+    [
+      ["non-canonical Swift literal address", "large", "402240"],
+      ["small Swift literal with storage", "small", "0x402270"],
+      ["large Swift literal without storage", "large", null],
+    ] as const
+  ).map(([name, representation, address]) => [
+    name,
+    "analyze_function",
+    {
+      ...dossier,
+      swift_string_literal_omissions: [],
+      swift_string_literals: [
+        {
+          source_address: "0x401004",
+          value: "The power setting could not be changed.",
+          representation,
+          address,
+          registers: ["x0", "x1"],
+          words: ["0xd000000000000027", "0x8000000000402220"],
+        },
+      ],
+    },
+  ]);
 
 const malformedOutputs = (): Array<
   [string, GhidraFunctionOperation, JsonValue]
@@ -252,6 +537,11 @@ const malformedOutputs = (): Array<
     throw new TypeError("Ghidra native API fixture is invalid");
   return [
     ["non-canonical address", "procedure_callers", ["401000"]],
+    [
+      "Swift literals without their omission record",
+      "analyze_function",
+      { ...dossier, swift_string_literals: [] },
+    ],
     [
       "missing classification",
       "procedure_info",
@@ -281,6 +571,26 @@ const malformedOutputs = (): Array<
       Object.fromEntries(
         Object.entries(dossier).filter(([key]) => key !== "native_api"),
       ),
+    ],
+    ...malformedSwiftStringLiterals(dossier),
+    [
+      "non-canonical Swift literal omission address",
+      "analyze_function",
+      {
+        ...dossier,
+        swift_string_literals: [],
+        swift_string_literal_omissions: [
+          {
+            source_address: "0x401004",
+            representation: "large",
+            address: "402240",
+            byte_length: 39,
+            reason: "capacity",
+            registers: ["x0", "x1"],
+            words: ["0xd000000000000027", "0x8000000000402220"],
+          },
+        ],
+      },
     ],
     [
       "non-canonical native API target",
@@ -364,7 +674,7 @@ describe("complete Ghidra function body range evidence", () => {
     body: body(),
   });
   it("preserves inclusive disjoint ranges and distinguishes owned bytes from enclosing span", () => {
-    expect(parseGhidraFunctionResult("procedure_info", info())).toMatchObject({
+    expect(parseFunctionValueFixture("procedure_info", info())).toMatchObject({
       ok: true,
       value: { body: body(), length: 5 },
     });
@@ -372,7 +682,7 @@ describe("complete Ghidra function body range evidence", () => {
   it("rejects omitted body evidence instead of accepting a length as complete coverage", () => {
     const { body: omitted, ...withoutBody } = info();
     expect(omitted.total_bytes).toBe(5);
-    expect(parseGhidraFunctionResult("procedure_info", withoutBody).ok).toBe(
+    expect(parseFunctionValueFixture("procedure_info", withoutBody).ok).toBe(
       false,
     );
   });
@@ -386,14 +696,14 @@ describe("complete Ghidra function body range evidence", () => {
       contains_entry: false,
     };
     expect(
-      parseGhidraFunctionResult("procedure_info", {
+      parseFunctionValueFixture("procedure_info", {
         ...info(),
         body: empty,
         length: 0,
       }).ok,
     ).toBe(false);
     expect(
-      parseGhidraFunctionResult("procedure_info", {
+      parseFunctionValueFixture("procedure_info", {
         ...info(),
         classification: { ...ghidraFunctionClassification(), external: true },
         body: empty,
@@ -406,7 +716,7 @@ describe("complete Ghidra function body range evidence", () => {
     const { body: omitted, ...identity } = ghidraFunctionIdentity();
     expect(omitted.total_bytes).toBe(6);
     expect(
-      parseGhidraFunctionResult("analyze_function", {
+      parseFunctionValueFixture("analyze_function", {
         ...dossier,
         callers: [identity],
       }).ok,
@@ -414,10 +724,10 @@ describe("complete Ghidra function body range evidence", () => {
   });
   it("requires body length and Ghidra-specific body provenance", () => {
     expect(
-      parseGhidraFunctionResult("procedure_info", { ...info(), length: 18 }).ok,
+      parseFunctionValueFixture("procedure_info", { ...info(), length: 18 }).ok,
     ).toBe(false);
     expect(
-      parseGhidraFunctionResult("procedure_info", {
+      parseFunctionValueFixture("procedure_info", {
         ...info(),
         body: { ...body(), provenance: "unreviewed" },
       }).ok,
@@ -437,7 +747,7 @@ describe("complete Ghidra function body range evidence", () => {
     { ranges: [{ start: "0x401002", end: "0x401000" }] },
   ])("rejects contradictory complete body facts %j", (change) => {
     expect(
-      parseGhidraFunctionResult("procedure_info", {
+      parseFunctionValueFixture("procedure_info", {
         ...info(),
         body: { ...body(), ...change },
       }).ok,

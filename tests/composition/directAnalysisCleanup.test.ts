@@ -84,7 +84,7 @@ describe("one-shot analysis cleanup outcomes", () => {
           operation: "read_bytes",
           subject: { local_path: path },
           normalized_result: { observation: "retained result" },
-          raw_result: { observation: "retained result" },
+          raw_result: null,
         },
       },
     });
@@ -198,7 +198,7 @@ describe("managed one-shot cleanup outcomes", () => {
               operation: "inspect_managed_artifact",
               observation: "retained result",
             },
-            rawResult: { observation: "retained result" },
+            rawResult: null,
             provider: { id: "fixture" },
           },
         },
@@ -219,7 +219,11 @@ describe("managed one-shot cleanup outcomes", () => {
     );
     expect(result.ok).toBe(false);
     if (result.ok) return;
-    expect(result.error.cause).toBe(primaryError);
+    expect(result.error.cause).toBeInstanceOf(AggregateError);
+    expect(result.error.cause).toMatchObject({
+      cause: primaryError,
+      errors: [primaryError, cleanupError],
+    });
     expect(projectAnalysisError(result.error)).toMatchObject({
       code: "cleanup_incomplete",
       details: {

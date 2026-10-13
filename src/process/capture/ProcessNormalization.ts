@@ -17,26 +17,53 @@ export const normalizeProcessText = (
   pid: number,
 ): string => {
   let normalized = value;
-  if (scenario.normalization.paths) {
-    normalized = normalized.replaceAll(temporaryRoot, "<temporary-root>");
-    normalized = normalized.replaceAll(
-      scenario.working_directory,
-      "<working-directory>",
-    );
-    normalized = normalized.replaceAll(scenario.executable, "<executable>");
-    for (const [index, root] of scenario.filesystem_observation_paths.entries())
-      normalized = normalized.replaceAll(
-        root,
-        `<filesystem-root-${String(index)}>`,
-      );
-  }
+  if (scenario.normalization.paths)
+    normalized = normalizePathTokens(normalized, scenario, temporaryRoot);
   if (scenario.normalization.ports)
     normalized = normalizePortTokens(normalized);
   if (scenario.normalization.pids)
     normalized = normalizePidTokens(normalized, [pid]);
+  // A callback keeps replacement text literal while preserving replaceAll's
+  // empty-pattern boundaries, which the process scenario contract permits.
   for (const pattern of scenario.normalization.patterns)
-    normalized = normalized.replaceAll(pattern.pattern, pattern.replacement);
+    normalized = normalized.replaceAll(
+      pattern.pattern,
+      () => pattern.replacement,
+    );
   return normalized;
+};
+
+/** Match original paths once, preferring the most specific selected identity. */
+const normalizePathTokens = (
+  value: string,
+  scenario: ProcessScenario,
+  temporaryRoot: string,
+): string => {
+  const aliases = new Map<string, string>();
+  const selected: readonly (readonly [string, string])[] = [
+    [temporaryRoot, "<temporary-root>"],
+    [scenario.working_directory, "<working-directory>"],
+    [scenario.executable, "<executable>"],
+    ...scenario.filesystem_observation_paths.map(
+      (root, index): readonly [string, string] => [
+        root,
+        `<filesystem-root-${String(index)}>`,
+      ],
+    ),
+  ];
+  for (const [path, alias] of selected)
+    if (path !== "" && !aliases.has(path)) aliases.set(path, alias);
+  const paths = [...aliases.keys()].sort(
+    (left, right) => right.length - left.length,
+  );
+  if (paths.length === 0) return value;
+  const pattern = paths
+    .map((path) => path.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
+    .join("|");
+  return value.replace(
+    new RegExp(pattern, "gu"),
+    (path) => aliases.get(path) ?? path,
+  );
 };
 
 // A port may end a sentence, but a period followed by a letter, digit, or
