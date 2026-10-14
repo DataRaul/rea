@@ -5,9 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main, "release/*"]
-  schedule:
-    - cron: "23 0-2,4-23 * * *"
-    - cron: "23 3 * * *"
+  # Reference fork: scheduled CI disabled; PR, push and manual triggers remain.
   workflow_dispatch:
   workflow_call:
     inputs:

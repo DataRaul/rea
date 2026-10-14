@@ -1,8 +1,7 @@
 name: CI timings
 
 on:
-  schedule:
-    - cron: "17 * * * *"
+  # Reference fork: no automatic scheduled runs; manual invocation remains available.
   workflow_dispatch:
 
 concurrency:
