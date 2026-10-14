@@ -32,5 +32,6 @@
 2. Preserve required copyright, license and third-party notices. Review any new vendored files, binaries or distributions separately before redistribution.
 3. If local changes are published, describe them accurately without presenting the fork as the upstream release.
 4. Validate an actual runtime/integration separately; a source-code fork is **not** proof that installation or analysis functionality works.
+5. **Reference-fork Actions policy (2026-10-14):** Automatic scheduled GitHub Actions are disabled in this fork. Review incoming upstream workflow changes before merging and prevent reintroduction of periodic cron triggers. If scheduled runs are ever explicitly authorized, keep the combined frequency at no more than twice per week.
 
 This file records a limited factual review of the source tree on 2026-10-09, not legal advice or a certification of every dependency.
